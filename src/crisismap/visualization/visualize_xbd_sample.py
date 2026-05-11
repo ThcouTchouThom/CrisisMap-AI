@@ -1,14 +1,8 @@
-"""Visualize one xBD/xView2 pre/post image pair with labels and target mask."""
-
-from __future__ import annotations
+"""Visualize one xBD/xView2 sample with class-aware target colors."""
 
 import argparse
 import json
-import re
-import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,39 +11,36 @@ from PIL import Image
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 TARGET_SUFFIXES = IMAGE_SUFFIXES | {".npy", ".npz"}
-XBD_STEM_PATTERN = re.compile(
-    r"^(?P<pair_id>.+)_(?P<phase>pre|post)_disaster$",
-    flags=re.IGNORECASE,
-)
+PRE_SUFFIX = "_pre_disaster"
+POST_SUFFIX = "_post_disaster"
+UNKNOWN_CLASS = -1
+
+CLASS_DEFINITIONS = {
+    "5-class": {
+        0: ("background", (0.05, 0.05, 0.05)),
+        1: ("no damage", (0.10, 0.58, 0.24)),
+        2: ("minor damage", (1.00, 0.82, 0.14)),
+        3: ("major damage", (1.00, 0.46, 0.08)),
+        4: ("destroyed", (0.82, 0.05, 0.08)),
+    },
+    "3-class": {
+        0: ("background", (0.05, 0.05, 0.05)),
+        1: ("no damage", (0.10, 0.58, 0.24)),
+        2: ("damaged", (0.88, 0.09, 0.11)),
+    },
+}
+UNKNOWN_DEFINITION = ("unknown", (0.70, 0.12, 0.80))
 
 
 class VisualizationError(Exception):
     """Raised when a requested xBD sample cannot be loaded cleanly."""
 
 
-@dataclass(frozen=True)
-class XbdAsset:
-    path: Path
-    stem: str
-    pair_id: str
-    phase: str
-
-
-@dataclass(frozen=True)
-class XbdPair:
-    pair_id: str
-    pre_image: Path
-    post_image: Path
-    target_mask: Path
-    pre_label: Path | None
-    post_label: Path | None
-
-
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Visualize one xBD/xView2 training sample. The dataset is read-only; "
-            "the script only writes a file when --output is provided."
+            "the script only writes a figure when --output is provided."
         )
     )
     parser.add_argument(
@@ -70,20 +61,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path where the generated figure should be saved.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("5-class", "3-class"),
+        default="5-class",
+        help="Target mask display mode.",
+    )
     return parser.parse_args()
 
 
-def find_named_dirs(root: Path, dirname: str) -> list[Path]:
-    """Find folders named dirname under root without descending into matches."""
-
-    matches: list[Path] = []
+def find_named_dirs(root, dirname):
+    matches = []
     stack = [root]
     target_name = dirname.lower()
 
     while stack:
         current = stack.pop()
         try:
-            children = sorted(p for p in current.iterdir() if p.is_dir())
+            children = sorted(path for path in current.iterdir() if path.is_dir())
         except OSError as exc:
             raise VisualizationError(f"Could not read directory '{current}': {exc}") from exc
 
@@ -96,8 +91,8 @@ def find_named_dirs(root: Path, dirname: str) -> list[Path]:
     return sorted(matches)
 
 
-def collect_files(folders: Iterable[Path], suffixes: set[str]) -> list[Path]:
-    files: list[Path] = []
+def collect_files(folders, suffixes):
+    files = []
     for folder in folders:
         try:
             for path in folder.rglob("*"):
@@ -108,33 +103,42 @@ def collect_files(folders: Iterable[Path], suffixes: set[str]) -> list[Path]:
     return sorted(files)
 
 
-def parse_xbd_asset(path: Path) -> XbdAsset | None:
-    match = XBD_STEM_PATTERN.match(path.stem)
-    if not match:
-        return None
+def parse_xbd_asset(path):
+    stem = path.stem
+    stem_lower = stem.lower()
 
-    return XbdAsset(
-        path=path,
-        stem=path.stem,
-        pair_id=match.group("pair_id"),
-        phase=match.group("phase").lower(),
-    )
+    if stem_lower.endswith(PRE_SUFFIX):
+        return {
+            "path": path,
+            "stem": stem,
+            "pair_id": stem[: -len(PRE_SUFFIX)],
+            "phase": "pre",
+        }
+    if stem_lower.endswith(POST_SUFFIX):
+        return {
+            "path": path,
+            "stem": stem,
+            "pair_id": stem[: -len(POST_SUFFIX)],
+            "phase": "post",
+        }
+    return None
 
 
-def indexed_assets(paths: Iterable[Path]) -> dict[tuple[str, str], Path]:
-    index: dict[tuple[str, str], Path] = {}
+def indexed_assets(paths):
+    index = {}
     for path in paths:
         asset = parse_xbd_asset(path)
         if asset is None:
             continue
-        index.setdefault((asset.pair_id.lower(), asset.phase), path)
+        key = (asset["pair_id"].lower(), asset["phase"])
+        index.setdefault(key, path)
     return index
 
 
-def target_stem_candidates(pair_id: str) -> list[str]:
+def target_stem_candidates(pair_id):
     pair = pair_id.lower()
-    post = f"{pair}_post_disaster"
-    pre = f"{pair}_pre_disaster"
+    post = f"{pair}{POST_SUFFIX}"
+    pre = f"{pair}{PRE_SUFFIX}"
     return [
         f"{pair}_target",
         f"{pair}_targets",
@@ -154,8 +158,8 @@ def target_stem_candidates(pair_id: str) -> list[str]:
     ]
 
 
-def find_target_mask(pair_id: str, target_files: Iterable[Path]) -> Path | None:
-    targets_by_stem: dict[str, list[Path]] = {}
+def find_target_mask(pair_id, target_files):
+    targets_by_stem = {}
     for target in target_files:
         targets_by_stem.setdefault(target.stem.lower(), []).append(target)
 
@@ -164,16 +168,23 @@ def find_target_mask(pair_id: str, target_files: Iterable[Path]) -> Path | None:
         if matches:
             return matches[0]
 
-    pair_prefix = pair_id.lower()
     fallback_matches = sorted(
         target
         for target in target_files
-        if target.stem.lower().startswith(pair_prefix)
+        if target.stem.lower().startswith(pair_id.lower())
     )
     return fallback_matches[0] if fallback_matches else None
 
 
-def discover_pair(root: Path, pair_id: str | None) -> XbdPair:
+def has_complete_sample(pair_id, labels, target_files):
+    return (
+        (pair_id, "pre") in labels
+        and (pair_id, "post") in labels
+        and find_target_mask(pair_id, target_files) is not None
+    )
+
+
+def discover_pair(root, pair_id):
     root = root.expanduser().resolve()
     if not root.exists():
         raise VisualizationError(f"Root path does not exist: {root}")
@@ -219,17 +230,15 @@ def discover_pair(root: Path, pair_id: str | None) -> XbdPair:
 
     if selected_pair is None:
         for candidate_pair in available_pair_ids:
-            if not has_complete_sample(candidate_pair, labels, target_files):
-                continue
-            selected_pair = candidate_pair
-            break
+            if has_complete_sample(candidate_pair, labels, target_files):
+                selected_pair = candidate_pair
+                break
 
     if selected_pair is None:
         raise VisualizationError(
             "No complete sample found with pre image, post image, both JSON labels, "
             "and a target mask."
         )
-
     if selected_pair not in available_pair_ids:
         raise VisualizationError(
             f"Pair id '{pair_id}' was not found with both pre and post images."
@@ -250,29 +259,17 @@ def discover_pair(root: Path, pair_id: str | None) -> XbdPair:
             f"No post-disaster JSON label found for pair id '{selected_pair}'."
         )
 
-    return XbdPair(
-        pair_id=selected_pair,
-        pre_image=images[(selected_pair, "pre")],
-        post_image=images[(selected_pair, "post")],
-        target_mask=target_mask,
-        pre_label=pre_label,
-        post_label=post_label,
-    )
+    return {
+        "pair_id": selected_pair,
+        "pre_image": images[(selected_pair, "pre")],
+        "post_image": images[(selected_pair, "post")],
+        "target_mask": target_mask,
+        "pre_label": pre_label,
+        "post_label": post_label,
+    }
 
 
-def has_complete_sample(
-    pair_id: str,
-    labels: dict[tuple[str, str], Path],
-    target_files: Iterable[Path],
-) -> bool:
-    return (
-        (pair_id, "pre") in labels
-        and (pair_id, "post") in labels
-        and find_target_mask(pair_id, target_files) is not None
-    )
-
-
-def load_rgb_image(path: Path) -> np.ndarray:
+def load_rgb_image(path):
     try:
         with Image.open(path) as image:
             return np.asarray(image.convert("RGB"))
@@ -280,7 +277,7 @@ def load_rgb_image(path: Path) -> np.ndarray:
         raise VisualizationError(f"Could not load image '{path}': {exc}") from exc
 
 
-def load_target_mask(path: Path) -> np.ndarray:
+def load_target_mask(path):
     try:
         if path.suffix.lower() == ".npy":
             return np.asarray(np.load(path))
@@ -295,46 +292,124 @@ def load_target_mask(path: Path) -> np.ndarray:
         raise VisualizationError(f"Could not load target mask '{path}': {exc}") from exc
 
 
-def mask_for_overlay(mask: np.ndarray, expected_shape: tuple[int, int]) -> np.ndarray:
-    overlay_mask = np.asarray(mask)
-    if overlay_mask.ndim == 3:
-        if overlay_mask.shape[:2] == expected_shape:
-            overlay_mask = np.max(overlay_mask, axis=2)
-        elif overlay_mask.shape[1:] == expected_shape:
-            overlay_mask = np.max(overlay_mask, axis=0)
+def target_class_map(mask, expected_shape):
+    class_map = np.asarray(mask)
+
+    if class_map.ndim == 3:
+        if class_map.shape[:2] == expected_shape:
+            class_map = reduce_mask_channels(class_map)
+        elif class_map.shape[1:] == expected_shape:
+            class_map = reduce_mask_channels(np.moveaxis(class_map, 0, -1))
         else:
             raise VisualizationError(
                 "Target mask shape does not match post-disaster image: "
-                f"mask={overlay_mask.shape}, post_image={expected_shape}."
+                f"mask={class_map.shape}, post_image={expected_shape}."
             )
-    if overlay_mask.ndim != 2:
+
+    if class_map.ndim != 2:
         raise VisualizationError(
-            f"Target mask must be 2D or RGB-like; got shape {overlay_mask.shape}."
+            f"Target mask must be 2D or RGB-like; got shape {class_map.shape}."
         )
-    if overlay_mask.shape != expected_shape:
+    if class_map.shape != expected_shape:
         raise VisualizationError(
             "Target mask shape does not match post-disaster image: "
-            f"mask={overlay_mask.shape}, post_image={expected_shape}."
+            f"mask={class_map.shape}, post_image={expected_shape}."
         )
-    return overlay_mask
+    if not np.issubdtype(class_map.dtype, np.number):
+        raise VisualizationError(
+            f"Target mask must contain numeric class ids: {class_map.dtype}."
+        )
+
+    rounded = np.rint(class_map)
+    if not np.allclose(class_map, rounded):
+        raise VisualizationError("Target mask contains non-integer class values.")
+    return rounded.astype(np.int16, copy=False)
 
 
-def mask_for_display(mask: np.ndarray) -> tuple[np.ndarray, str | None]:
-    display_mask = np.asarray(mask)
-    if display_mask.ndim == 2:
-        return display_mask, "gray"
-    if display_mask.ndim == 3 and display_mask.shape[2] in (3, 4):
-        return display_mask, None
-    if display_mask.ndim == 3 and display_mask.shape[0] in (1, 3, 4):
-        return np.max(display_mask, axis=0), "gray"
-    if display_mask.ndim == 3:
-        return np.max(display_mask, axis=2), "gray"
-    raise VisualizationError(
-        f"Target mask cannot be displayed with shape {display_mask.shape}."
-    )
+def reduce_mask_channels(mask):
+    if mask.shape[2] == 1:
+        return mask[:, :, 0]
+    if mask.shape[2] in (3, 4):
+        rgb = mask[:, :, :3]
+        if np.array_equal(rgb[:, :, 0], rgb[:, :, 1]) and np.array_equal(
+            rgb[:, :, 0],
+            rgb[:, :, 2],
+        ):
+            return rgb[:, :, 0]
+        return np.max(rgb, axis=2)
+    raise VisualizationError(f"Unsupported target mask channel count: {mask.shape}.")
 
 
-def read_json(path: Path) -> dict:
+def display_class_map(class_map, mode):
+    if mode == "5-class":
+        display_map = class_map.copy()
+        known = np.isin(display_map, list(CLASS_DEFINITIONS[mode]))
+        display_map[~known] = UNKNOWN_CLASS
+        return display_map
+
+    display_map = np.full(class_map.shape, UNKNOWN_CLASS, dtype=np.int16)
+    display_map[class_map == 0] = 0
+    display_map[class_map == 1] = 1
+    display_map[np.isin(class_map, [2, 3, 4])] = 2
+    return display_map
+
+
+def colorize_class_map(display_map, mode):
+    colors = CLASS_DEFINITIONS[mode]
+    color_image = np.zeros((*display_map.shape, 3), dtype=np.float32)
+
+    for class_id, (_, color) in colors.items():
+        color_image[display_map == class_id] = color
+    color_image[display_map == UNKNOWN_CLASS] = UNKNOWN_DEFINITION[1]
+    return color_image
+
+
+def blend_overlay(image, color_image, display_map):
+    image_float = image.astype(np.float32) / 255.0
+    alpha = np.zeros(display_map.shape, dtype=np.float32)
+    alpha[display_map == 1] = 0.38
+    alpha[(display_map != 0) & (display_map != 1)] = 0.52
+    alpha = alpha[:, :, None]
+    return image_float * (1.0 - alpha) + color_image * alpha
+
+
+def legend_handles(display_map, mode):
+    handles = []
+    colors = CLASS_DEFINITIONS[mode]
+    observed = set(int(value) for value in np.unique(display_map))
+
+    for class_id, (label, color) in colors.items():
+        handles.append(
+            plt.Line2D(
+                [0],
+                [0],
+                marker="s",
+                linestyle="",
+                markerfacecolor=color,
+                markeredgecolor="white",
+                label=f"{class_id} = {label}",
+                markersize=10,
+            )
+        )
+
+    if UNKNOWN_CLASS in observed:
+        label, color = UNKNOWN_DEFINITION
+        handles.append(
+            plt.Line2D(
+                [0],
+                [0],
+                marker="s",
+                linestyle="",
+                markerfacecolor=color,
+                markeredgecolor="white",
+                label=label,
+                markersize=10,
+            )
+        )
+    return handles
+
+
+def read_json(path):
     try:
         with path.open("r", encoding="utf-8") as file:
             data = json.load(file)
@@ -348,12 +423,11 @@ def read_json(path: Path) -> dict:
     return data
 
 
-def count_building_features(label: dict) -> int | None:
+def count_building_features(label):
     features = label.get("features")
     if isinstance(features, dict):
         for key in ("xy", "lng_lat"):
-            items = features.get(key)
-            count = count_buildings_in_feature_list(items)
+            count = count_buildings_in_feature_list(features.get(key))
             if count is not None:
                 return count
     if isinstance(features, list):
@@ -361,7 +435,7 @@ def count_building_features(label: dict) -> int | None:
     return None
 
 
-def count_buildings_in_feature_list(items: object) -> int | None:
+def count_buildings_in_feature_list(items):
     if not isinstance(items, list):
         return None
 
@@ -384,12 +458,8 @@ def count_buildings_in_feature_list(items: object) -> int | None:
     return len(items)
 
 
-def print_label_info(label_name: str, label_path: Path | None, root: Path) -> None:
+def print_label_info(label_name, label_path, root):
     print(f"{label_name} label:")
-    if label_path is None:
-        print("  missing")
-        return
-
     label = read_json(label_path)
     metadata = label.get("metadata")
     metadata_keys = sorted(metadata.keys()) if isinstance(metadata, dict) else []
@@ -408,56 +478,69 @@ def print_label_info(label_name: str, label_path: Path | None, root: Path) -> No
     print(f"  label file: {relative_path(label_path, root)}")
 
 
-def relative_path(path: Path, root: Path) -> str:
+def print_target_counts(class_map):
+    values, counts = np.unique(class_map, return_counts=True)
+    print("Target mask values:")
+    for value, count in zip(values, counts):
+        print(f"  {int(value)}: {int(count)} pixels")
+    print(f"  total: {int(class_map.size)} pixels")
+
+
+def relative_path(path, root):
     try:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
 
 
-def build_figure(pair: XbdPair, root: Path) -> plt.Figure:
-    pre_image = load_rgb_image(pair.pre_image)
-    post_image = load_rgb_image(pair.post_image)
-    target_mask = load_target_mask(pair.target_mask)
-    overlay_mask = mask_for_overlay(target_mask, post_image.shape[:2])
-    display_mask, display_cmap = mask_for_display(target_mask)
+def build_figure(pair, root, mode):
+    pre_image = load_rgb_image(pair["pre_image"])
+    post_image = load_rgb_image(pair["post_image"])
+    target_mask = load_target_mask(pair["target_mask"])
+    class_map = target_class_map(target_mask, post_image.shape[:2])
+    display_map = display_class_map(class_map, mode)
+    color_mask = colorize_class_map(display_map, mode)
+    overlay = blend_overlay(post_image, color_mask, display_map)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10), constrained_layout=True)
-    fig.suptitle(f"xBD/xView2 sample: {pair.pair_id}", fontsize=14)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f"xBD/xView2 sample: {pair['pair_id']} ({mode})", fontsize=14)
 
     panels = [
-        (axes[0, 0], pre_image, "Pre-disaster image", None),
-        (axes[0, 1], post_image, "Post-disaster image", None),
-        (axes[1, 0], display_mask, "Raw target mask", display_cmap),
+        (axes[0, 0], pre_image, "Pre-disaster image"),
+        (axes[0, 1], post_image, "Post-disaster image"),
+        (axes[1, 0], color_mask, "Colorized target mask"),
+        (axes[1, 1], overlay, "Post-disaster image with class overlay"),
     ]
 
-    for axis, data, title, cmap in panels:
-        axis.imshow(data, cmap=cmap)
+    for axis, image, title in panels:
+        axis.imshow(image)
         axis.set_title(title)
         axis.axis("off")
 
-    axes[1, 1].imshow(post_image)
-    axes[1, 1].imshow(
-        np.ma.masked_where(overlay_mask == 0, overlay_mask),
-        cmap="Reds",
-        alpha=0.45,
+    fig.legend(
+        handles=legend_handles(display_map, mode),
+        loc="lower center",
+        ncol=3 if mode == "5-class" else 2,
+        frameon=True,
     )
-    axes[1, 1].set_title("Post-disaster image with target overlay")
-    axes[1, 1].axis("off")
+    fig.subplots_adjust(bottom=0.14, left=0.02, right=0.98, top=0.92, wspace=0.04)
 
     print("Selected sample")
-    print(f"  pair id: {pair.pair_id}")
-    print(f"  pre image: {relative_path(pair.pre_image, root)}")
-    print(f"  post image: {relative_path(pair.post_image, root)}")
-    print(f"  target mask: {relative_path(pair.target_mask, root)}")
+    print(f"  pair id: {pair['pair_id']}")
+    print(f"  mode: {mode}")
+    print(f"  pre image: {relative_path(pair['pre_image'], root)}")
+    print(f"  post image: {relative_path(pair['post_image'], root)}")
+    print(f"  target mask: {relative_path(pair['target_mask'], root)}")
     print()
-    print_label_info("Pre-disaster", pair.pre_label, root)
-    print_label_info("Post-disaster", pair.post_label, root)
+    print_target_counts(class_map)
+    print()
+    print_label_info("Pre-disaster", pair["pre_label"], root)
+    print_label_info("Post-disaster", pair["post_label"], root)
 
     return fig
 
 
-def save_or_show(fig: plt.Figure, output: Path | None) -> None:
+def save_or_show(fig, output):
     if output is None:
         plt.show()
         return
@@ -469,16 +552,16 @@ def save_or_show(fig: plt.Figure, output: Path | None) -> None:
     print(f"Saved figure: {output}")
 
 
-def main() -> int:
+def main():
     args = parse_args()
     root = args.root.expanduser().resolve()
 
     try:
         pair = discover_pair(root, args.pair_id)
-        fig = build_figure(pair, root)
+        fig = build_figure(pair, root, args.mode)
         save_or_show(fig, args.output)
     except VisualizationError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {exc}")
         return 1
 
     return 0
