@@ -1,0 +1,1 @@
+"""CrisisMap AI package."""

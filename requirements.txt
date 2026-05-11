@@ -1,0 +1,22 @@
+# Core scientific Python stack
+numpy
+pandas
+scikit-learn
+tqdm
+
+# Image processing and visualization
+pillow
+opencv-python
+matplotlib
+
+# Deep learning baseline
+torch
+torchvision
+
+# Configuration and notebooks
+pyyaml
+jupyter
+ipykernel
+
+# Geometry helpers for xBD building polygons and labels
+shapely

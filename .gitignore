@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment and local config
+.env
+.env.*
+*.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Keep large datasets and generated artifacts out of Git.
+# Extract the official xBD/xView2 archive to data/raw/xbd/.
+data/raw/*
+data/processed/*
+data/samples/*
+outputs/checkpoints/*
+outputs/figures/*
+outputs/predictions/*
+
+# Allow lightweight documentation files inside ignored artifact folders.
+!data/raw/README.md
+!data/processed/README.md
+!data/samples/README.md
+!outputs/checkpoints/README.md
+!outputs/figures/README.md
+!outputs/predictions/README.md
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Course documents
+*.pdf
+
+# Model weights and exported models
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Logs
+logs/
+*.log
