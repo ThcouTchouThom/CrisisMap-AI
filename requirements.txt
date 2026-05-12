@@ -20,3 +20,6 @@ ipykernel
 
 # Geometry helpers for xBD building polygons and labels
 shapely
+
+# App
+streamlit

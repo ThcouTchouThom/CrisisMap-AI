@@ -1,3 +1,17 @@
-# App
+# Aftermath Streamlit App
 
-Prototype UI or demo entry points for visualizing CrisisMap AI predictions.
+This folder contains the first Streamlit prototype for visualizing CrisisMap AI
+U-Net predictions on xBD/xView2 train, validation, or test pairs. The app is
+branded as Aftermath and presents a French UI for the damage mapping demo.
+
+Expected local files:
+
+- xBD training data: `data/raw/xbd/train`
+- split CSVs: `data/processed/splits`
+- checkpoint: `outputs/checkpoints/unet_baseline_512_v2_30epochs/best_unet.pt`
+
+Run from the project root:
+
+```powershell
+streamlit run app/streamlit_app.py
+```
