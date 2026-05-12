@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 
@@ -23,6 +24,8 @@ from crisismap.models.unet import UNet  # noqa: E402
 
 
 TARGET_MODES = {"3-class", "5-class"}
+LOSS_CHOICES = {"ce", "weighted-ce", "ce-dice"}
+DEFAULT_3_CLASS_WEIGHTS = [0.05, 1.0, 4.0]
 
 
 class TrainingError(Exception):
@@ -61,6 +64,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
+        "--loss",
+        choices=sorted(LOSS_CHOICES),
+        default="weighted-ce",
+        help=(
+            "Training loss. 'weighted-ce' is the default to keep the baseline "
+            "class-imbalance handling style."
+        ),
+    )
+    parser.add_argument(
+        "--class-weights",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("W_BACKGROUND", "W_NO_DAMAGE", "W_DAMAGED"),
+        help=(
+            "Optional 3-class loss weights, for example: "
+            "--class-weights 0.05 1.0 4.0"
+        ),
+    )
+    parser.add_argument(
         "--target-mode",
         choices=sorted(TARGET_MODES),
         default="3-class",
@@ -95,6 +118,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise TrainingError("--max-train-samples must be a positive integer.")
     if args.max_val_samples is not None and args.max_val_samples <= 0:
         raise TrainingError("--max-val-samples must be a positive integer.")
+    if args.class_weights is not None:
+        if any(weight <= 0 for weight in args.class_weights):
+            raise TrainingError("--class-weights values must all be positive.")
+        if args.loss == "ce":
+            raise TrainingError(
+                "--class-weights can only be used with weighted-ce or ce-dice."
+            )
+        if args.target_mode != "3-class":
+            raise TrainingError("--class-weights currently expects --target-mode 3-class.")
 
 
 def prepare_output_dir(output_dir: Path) -> Path:
@@ -160,10 +192,90 @@ def parameter_count(model: torch.nn.Module) -> int:
     )
 
 
-def class_weights(target_mode: str, device: torch.device) -> torch.Tensor | None:
-    if target_mode == "3-class":
-        return torch.tensor([0.2, 1.0, 2.0], dtype=torch.float32, device=device)
-    return None
+class MulticlassDiceLoss(torch.nn.Module):
+    """Mean multiclass Dice loss for logits and integer targets."""
+
+    def __init__(self, num_classes: int, epsilon: float = 1e-6) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.epsilon = epsilon
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probabilities = torch.softmax(logits, dim=1)
+        one_hot = F.one_hot(targets, num_classes=self.num_classes)
+        one_hot = one_hot.permute(0, 3, 1, 2).to(dtype=probabilities.dtype)
+
+        reduce_dims = (0, 2, 3)
+        intersection = torch.sum(probabilities * one_hot, dim=reduce_dims)
+        denominator = torch.sum(probabilities, dim=reduce_dims) + torch.sum(
+            one_hot,
+            dim=reduce_dims,
+        )
+        dice = (2.0 * intersection + self.epsilon) / (denominator + self.epsilon)
+        return torch.mean(1.0 - dice)
+
+
+class CrossEntropyDiceLoss(torch.nn.Module):
+    """Weighted cross entropy plus multiclass Dice loss."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        class_weights: torch.Tensor | None,
+    ) -> None:
+        super().__init__()
+        self.cross_entropy = torch.nn.CrossEntropyLoss(weight=class_weights)
+        self.dice = MulticlassDiceLoss(num_classes=num_classes)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return self.cross_entropy(logits, targets) + self.dice(logits, targets)
+
+
+def build_criterion(
+    loss_name: str,
+    target_mode: str,
+    num_classes: int,
+    class_weights_arg: list[float] | None,
+    device: torch.device,
+) -> tuple[torch.nn.Module, dict[str, object]]:
+    weights = resolve_class_weights(loss_name, target_mode, class_weights_arg, device)
+
+    if loss_name == "ce":
+        criterion = torch.nn.CrossEntropyLoss()
+    elif loss_name == "weighted-ce":
+        criterion = torch.nn.CrossEntropyLoss(weight=weights)
+    elif loss_name == "ce-dice":
+        criterion = CrossEntropyDiceLoss(num_classes=num_classes, class_weights=weights)
+    else:
+        raise TrainingError(f"Unsupported loss: {loss_name}")
+
+    weights_list = (
+        None if weights is None else [float(value) for value in weights.cpu()]
+    )
+    loss_config = {
+        "loss": loss_name,
+        "target_mode": target_mode,
+        "class_weights": weights_list,
+        "dice_epsilon": 1e-6 if loss_name == "ce-dice" else None,
+    }
+    return criterion, loss_config
+
+
+def resolve_class_weights(
+    loss_name: str,
+    target_mode: str,
+    class_weights_arg: list[float] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if loss_name == "ce":
+        return None
+    if class_weights_arg is not None:
+        weights = class_weights_arg
+    elif target_mode == "3-class":
+        weights = DEFAULT_3_CLASS_WEIGHTS
+    else:
+        return None
+    return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
 def train_one_epoch(
@@ -280,6 +392,7 @@ def save_checkpoint(
     epoch: int,
     metrics: dict[str, object],
     args: argparse.Namespace,
+    loss_config: dict[str, object],
 ) -> None:
     checkpoint = {
         "epoch": epoch,
@@ -287,6 +400,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": metrics,
         "config": vars(args),
+        "loss_config": loss_config,
     }
     torch.save(checkpoint, path)
 
@@ -364,7 +478,13 @@ def train(args: argparse.Namespace) -> None:
         num_classes=num_classes,
         base_channels=args.base_channels,
     ).to(device)
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights(args.target_mode, device))
+    criterion, loss_config = build_criterion(
+        loss_name=args.loss,
+        target_mode=args.target_mode,
+        num_classes=num_classes,
+        class_weights_arg=args.class_weights,
+        device=device,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -373,6 +493,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
     print(f"Model parameters: {parameter_count(model):,}")
+    print(f"Loss: {loss_config['loss']}")
+    print(f"Class weights: {loss_config['class_weights'] or 'none'}")
 
     best_mean_iou = -1.0
     history: list[dict[str, object]] = []
@@ -406,6 +528,8 @@ def train(args: argparse.Namespace) -> None:
             "val_mean_iou": val_metrics["mean_iou"],
             "val_iou_per_class": val_metrics["iou_per_class"],
             "epoch_seconds": time.time() - epoch_start,
+            "loss": loss_config["loss"],
+            "class_weights": loss_config["class_weights"],
         }
         history.append(epoch_metrics)
         print_epoch_summary(epoch_metrics)
@@ -419,6 +543,7 @@ def train(args: argparse.Namespace) -> None:
                 epoch,
                 epoch_metrics,
                 args,
+                loss_config,
             )
 
         save_checkpoint(
@@ -428,6 +553,7 @@ def train(args: argparse.Namespace) -> None:
             epoch,
             epoch_metrics,
             args,
+            loss_config,
         )
         write_metrics_history(output_dir / "metrics_history.json", history)
 
