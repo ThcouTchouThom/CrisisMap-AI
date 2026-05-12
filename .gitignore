@@ -22,20 +22,30 @@ env/
 .ipynb_checkpoints/
 
 # Keep large datasets and generated artifacts out of Git.
-# Extract the official xBD/xView2 archive to data/raw/xbd/.
-data/raw/*
+# Place official xBD/xView2 archives in data/raw/archives/.
+data/raw/archives/*
+data/raw/xbd/train/images/
+data/raw/xbd/train/labels/
+data/raw/xbd/train/targets/
+data/raw/geotransforms/*
 data/processed/*
 data/samples/*
-outputs/checkpoints/*
-outputs/figures/*
-outputs/predictions/*
+outputs/*
 
 # Allow lightweight documentation files inside ignored artifact folders.
 !data/raw/README.md
+!data/raw/archives/
+!data/raw/archives/README.md
 !data/processed/README.md
 !data/samples/README.md
+!outputs/checkpoints/
+outputs/checkpoints/*
 !outputs/checkpoints/README.md
+!outputs/figures/
+outputs/figures/*
 !outputs/figures/README.md
+!outputs/predictions/
+outputs/predictions/*
 !outputs/predictions/README.md
 
 # OS/editor noise

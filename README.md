@@ -20,6 +20,45 @@ data/raw/xbd/
 
 The xBD archive, extracted satellite images, labels, generated masks, model checkpoints, and prediction outputs are not stored in GitHub. Keep raw imagery under `data/raw/`, derived CSVs under `data/processed/`, and generated artifacts under `outputs/`.
 
+## Setup For Teammates
+
+Clone the repository, then place the externally shared xBD/xView2 archives in:
+
+```text
+data/raw/archives/
+```
+
+Expected files:
+
+- `data/raw/archives/train_images_labels_targets.tar`
+- `data/raw/archives/xview_geotransforms.json.tgz`
+
+Run the Windows PowerShell setup script from the project root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup_project.ps1
+```
+
+To rebuild processed index and split CSV files:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup_project.ps1 -Force
+```
+
+The script creates `.venv`, installs dependencies, extracts the local archives, validates the dataset, builds `data/processed/xbd_train_index.csv`, and creates split CSVs under `data/processed/splits/`.
+
+If you received a trained checkpoint, place it at:
+
+```text
+outputs/checkpoints/unet_baseline_512_v2_30epochs/best_unet.pt
+```
+
+Run the Streamlit prototype:
+
+```powershell
+streamlit run app/streamlit_app.py
+```
+
 ## MVP Approach
 
 Each sample combines:
