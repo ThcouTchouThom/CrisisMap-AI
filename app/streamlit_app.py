@@ -29,7 +29,7 @@ CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "outputs"
     / "checkpoints"
-    / "unet_baseline_512_v2_30epochs"
+    / "unet_512_ce_dice_w005_1_4_50epochs"
     / "best_unet.pt"
 )
 
@@ -37,7 +37,7 @@ IMAGE_SIZE = 512
 TARGET_MODE = "3-class"
 BASE_CHANNELS = 32
 
-CHECKPOINT_LABEL = "unet_baseline_512_v2_30epochs/best_unet.pt"
+CHECKPOINT_LABEL = "unet_512_ce_dice_w005_1_4_50epochs/best_unet.pt"
 RECOMMENDED_PAIR_IDS_BY_SPLIT = {
     "train": [
         "hurricane-harvey_00000000",
@@ -51,11 +51,11 @@ RECOMMENDED_PAIR_IDS_BY_SPLIT = {
         "santa-rosa-wildfire_00000129",
     ],
     "test": [
-        "hurricane-harvey_00000115",
+        "hurricane-harvey_00000358",
         "hurricane-harvey_00000132",
-        "hurricane-michael_00000120",
         "santa-rosa-wildfire_00000093",
         "palu-tsunami_00000109",
+        "hurricane-michael_00000120",
     ],
 }
 
@@ -219,10 +219,10 @@ def render_legend() -> None:
 def render_model_summary() -> None:
     st.sidebar.markdown("### Modèle actuel")
     st.sidebar.write(f"Checkpoint: `{CHECKPOINT_LABEL}`")
-    st.sidebar.write("Pixel accuracy: `0.9175`")
-    st.sidebar.write("Mean IoU: `0.6257`")
-    st.sidebar.write("IoU damaged: `0.3870`")
-    st.sidebar.write("F1 damaged: `0.5581`")
+    st.sidebar.write("Pixel accuracy: `0.9189`")
+    st.sidebar.write("Mean IoU: `0.6363`")
+    st.sidebar.write("IoU damaged: `0.4159`")
+    st.sidebar.write("F1 damaged: `0.5875`")
 
 
 def validate_required_paths() -> None:
