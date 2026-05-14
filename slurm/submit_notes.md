@@ -43,10 +43,22 @@ sbatch slurm/train_unet_full_1024.sbatch
 sbatch slurm/sweep_unet_1024.sbatch
 ```
 
+1024 damage-focused sweep:
+
+```bash
+sbatch slurm/sweep_unet_1024_damage_focused.sbatch
+```
+
 Force the sweep to rerun candidates:
 
 ```bash
 sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024.sbatch
+```
+
+Force the damage-focused sweep to rerun candidates:
+
+```bash
+sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024_damage_focused.sbatch
 ```
 
 ## Monitor
@@ -73,6 +85,7 @@ scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/outputs/checkpoints/<experimen
 scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/outputs/checkpoints/<experiment>/metrics_history.json outputs/checkpoints/<experiment>/
 scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/outputs/predictions/<experiment>_test_metrics.json outputs/predictions/
 scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/outputs/predictions/unet_1024_sweep_summary.csv outputs/predictions/
+scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/outputs/predictions/unet_1024_damage_focused_sweep_summary.csv outputs/predictions/
 scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/logs/<file>.out .
 scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/logs/<file>.err .
 scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/run_logs/<file>.log .

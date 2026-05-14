@@ -178,6 +178,79 @@ Force reruns:
 sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024.sbatch
 ```
 
+## Damage-Focused 1024 Sweep
+
+The completed 1024 full-data U-Net run showed that overall segmentation can be
+strong while damaged-class recall remains weak. The next sweep tests two
+targeted ideas without changing the model architecture:
+
+- larger batch sizes, because batch size can change gradient stability and may
+  help the model learn the rarer damaged class more consistently
+- damage-focused train/validation splits, because full xBD data is dominated by
+  background and no-damage pixels
+
+The damage-focused split keeps the same all-disaster setup and `min-nonzero`
+filter, then adds a minimum damage-ratio filter. To create the local split
+folders from Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/create_damage_focused_splits.ps1
+```
+
+This creates:
+
+```text
+data/processed/splits_damage001
+data/processed/splits_damage003
+data/processed/splits_damage005
+```
+
+On Rorqual, the damage-focused sweep will create
+`data/processed/splits_damage003/` automatically if it is missing.
+
+Launch the new sweep:
+
+```bash
+sbatch slurm/sweep_unet_1024_damage_focused.sbatch
+```
+
+It tests 1024 training for 50 epochs with batch sizes `2` and `4`, CE + Dice
+loss, three damaged-class weighting schemes, and two split variants:
+`splits_full` and `splits_damage003`.
+
+For fair comparison, every candidate is evaluated on:
+
+```text
+data/processed/splits_full/test_pairs.csv
+```
+
+The script skips candidates that already have a metrics JSON. If it finds an
+output folder without complete 50-epoch training history, it does not evaluate
+the partial checkpoint. To rebuild incomplete candidates:
+
+```bash
+sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024_damage_focused.sbatch
+```
+
+The sorted summary is written to:
+
+```text
+outputs/predictions/unet_1024_damage_focused_sweep_summary.csv
+```
+
+Monitor logs:
+
+```bash
+tail -f ~/scratch/CrisisMap-AI/logs/aftermath_dmg1024-<jobid>.out
+tail -f ~/scratch/CrisisMap-AI/run_logs/<experiment>-<jobid>.log
+```
+
+Retrieve the summary CSV from local Windows PowerShell:
+
+```powershell
+scp tgrjlt2@<RORQUAL_HOST>:~/scratch/CrisisMap-AI/outputs/predictions/unet_1024_damage_focused_sweep_summary.csv outputs/predictions/
+```
+
 ## Monitor And Cancel
 
 ```bash
