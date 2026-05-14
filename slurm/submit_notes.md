@@ -12,6 +12,11 @@ cd ~/work/CrisisMap-AI
 bash slurm/setup_rorqual.sh
 ```
 
+The setup and job scripts load `opencv/4.13.0` before activating
+`~/virtualenvs/crisismap-ai`. Keep that order if editing the module stack,
+because `opencv-python` resolves to a Compute Canada wheel that requires the
+OpenCV module to be loaded before `pip install -r requirements.txt`.
+
 ## Status
 
 ```bash

@@ -14,10 +14,15 @@ These scripts use the known working Rorqual defaults:
 - account: `def-zonata_gpu`
 - partition: `gpubase_bygpu_b2`
 - GPU request: `--gres=gpu:h100:1`
-- modules: `StdEnv/2023`, `python/3.11`, `gcc`, `arrow/23.0.1`, `cuda`
+- modules: `StdEnv/2023`, `python/3.11`, `gcc`, `arrow/23.0.1`, `cuda`, `opencv/4.13.0`
 
 Account, partition, QoS, module versions, memory, time, and host names may need
 adjustment depending on your allocation.
+
+The OpenCV module is intentionally loaded before activating
+`~/virtualenvs/crisismap-ai` and before `pip install -r requirements.txt`.
+Rorqual resolves `opencv-python` through a Compute Canada dummy wheel that
+expects the cluster OpenCV module to be loaded first.
 
 ## Expected Layout
 
@@ -108,6 +113,7 @@ The setup script:
 - creates `data` and `outputs` symlinks
 - creates and activates `~/virtualenvs/crisismap-ai`
 - exports `TRITON_CACHE_DIR=~/scratch/CrisisMap-AI/triton_cache`
+- loads `opencv/4.13.0` before installing Python requirements
 - installs `requirements.txt`
 - verifies the two archives
 - extracts data if needed

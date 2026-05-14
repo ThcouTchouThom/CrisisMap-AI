@@ -21,6 +21,7 @@ module load python/3.11
 module load gcc
 module load arrow/23.0.1
 module load cuda
+module load opencv/4.13.0
 
 source "${HOME}/virtualenvs/crisismap-ai/bin/activate"
 export TRITON_CACHE_DIR="${HOME}/scratch/CrisisMap-AI/triton_cache"

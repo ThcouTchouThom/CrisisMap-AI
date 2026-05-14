@@ -83,6 +83,7 @@ module load python/3.11
 module load gcc
 module load arrow/23.0.1
 module load cuda
+module load opencv/4.13.0
 
 step "Create scratch directories"
 mkdir -p "${DATA_ROOT}/raw/archives"

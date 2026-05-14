@@ -11,6 +11,21 @@ echo "Expected code root: $CODE_ROOT"
 echo "Hostname: $(hostname)"
 echo
 
+echo "Modules:"
+if command -v module >/dev/null 2>&1; then
+  module --force purge
+  module load StdEnv/2023
+  module load python/3.11
+  module load gcc
+  module load arrow/23.0.1
+  module load cuda
+  module load opencv/4.13.0
+  module list
+else
+  echo "  module command is not available in this shell."
+fi
+echo
+
 echo "Git:"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "  Branch: $(git rev-parse --abbrev-ref HEAD)"
