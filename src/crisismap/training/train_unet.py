@@ -10,9 +10,10 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 
 PROJECT_SRC = Path(__file__).resolve().parents[2]
@@ -25,7 +26,12 @@ from crisismap.models.unet import UNet  # noqa: E402
 
 TARGET_MODES = {"3-class", "5-class"}
 LOSS_CHOICES = {"ce", "weighted-ce", "ce-dice"}
+AugmentMode = str
+SamplerMode = str
+AUGMENT_MODES = {"none", "safe", "damage-aware"}
+SAMPLER_MODES = {"none", "damage-simple", "damage-sqrt"}
 DEFAULT_3_CLASS_WEIGHTS = [0.05, 1.0, 4.0]
+DAMAGE_CLASSES = {2, 3, 4}
 
 
 class TrainingError(Exception):
@@ -92,6 +98,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
     parser.add_argument(
+        "--augment-mode",
+        choices=sorted(AUGMENT_MODES),
+        default="none",
+        help="Train-only augmentation mode.",
+    )
+    parser.add_argument(
+        "--augment-prob",
+        type=float,
+        default=0.5,
+        help="Probability of applying train-time augmentation.",
+    )
+    parser.add_argument(
+        "--damage-augment-threshold",
+        type=float,
+        default=0.001,
+        help="Damage ratio threshold used by damage-aware augmentation.",
+    )
+    parser.add_argument(
+        "--sampler",
+        choices=sorted(SAMPLER_MODES),
+        default="none",
+        help="Train-only sampling strategy.",
+    )
+    parser.add_argument(
+        "--damage-sampling-alpha",
+        type=float,
+        default=4.0,
+        help="Alpha used by --sampler damage-sqrt.",
+    )
+    parser.add_argument(
+        "--high-damage-threshold",
+        type=float,
+        default=0.02,
+        help="High-damage threshold used by --sampler damage-simple.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -118,6 +160,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise TrainingError("--max-train-samples must be a positive integer.")
     if args.max_val_samples is not None and args.max_val_samples <= 0:
         raise TrainingError("--max-val-samples must be a positive integer.")
+    if not 0.0 <= args.augment_prob <= 1.0:
+        raise TrainingError("--augment-prob must be between 0 and 1.")
+    if args.damage_augment_threshold < 0.0:
+        raise TrainingError("--damage-augment-threshold must be non-negative.")
+    if args.damage_sampling_alpha < 0.0:
+        raise TrainingError("--damage-sampling-alpha must be non-negative.")
+    if args.high_damage_threshold < 0.0:
+        raise TrainingError("--high-damage-threshold must be non-negative.")
     if args.class_weights is not None:
         if any(weight <= 0 for weight in args.class_weights):
             raise TrainingError("--class-weights values must all be positive.")
@@ -158,12 +208,18 @@ def make_dataset(
     image_size: int,
     target_mode: str,
     max_samples: int | None,
+    augment_mode: AugmentMode = "none",
+    augment_prob: float = 0.0,
+    damage_augment_threshold: float = 0.001,
 ) -> torch.utils.data.Dataset:
     dataset = XBDPairDataset(
         root=root,
         split_csv=split_csv,
         image_size=image_size,
         target_mode=target_mode,
+        augment_mode=augment_mode,
+        augment_prob=augment_prob,
+        damage_augment_threshold=damage_augment_threshold,
     )
     if max_samples is None:
         return dataset
@@ -176,14 +232,95 @@ def make_loader(
     num_workers: int,
     shuffle: bool,
     device: torch.device,
+    sampler: WeightedRandomSampler | None = None,
 ) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
     )
+
+
+def make_train_sampler(
+    dataset: torch.utils.data.Dataset,
+    sampler_mode: SamplerMode,
+    alpha: float,
+    high_damage_threshold: float,
+) -> WeightedRandomSampler | None:
+    if sampler_mode == "none":
+        return None
+
+    samples = dataset_samples(dataset)
+    damage_ratios = np.asarray(
+        [row_damage_ratio(row) for row in samples.to_dict(orient="records")],
+        dtype=np.float64,
+    )
+
+    if sampler_mode == "damage-simple":
+        has_damage = damage_ratios > 0.001
+        high_damage = damage_ratios > high_damage_threshold
+        weights = 1.0 + 4.0 * has_damage.astype(np.float64)
+        weights = weights + 2.0 * high_damage.astype(np.float64)
+    elif sampler_mode == "damage-sqrt":
+        weights = 1.0 + alpha * np.sqrt(np.clip(damage_ratios, a_min=0.0, a_max=None))
+    else:
+        raise TrainingError(f"Unsupported sampler: {sampler_mode}")
+
+    if not np.all(np.isfinite(weights)) or np.any(weights <= 0):
+        raise TrainingError("Sampler weights must be finite and positive.")
+
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+    )
+
+
+def dataset_samples(dataset: torch.utils.data.Dataset) -> pd.DataFrame:
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        if not isinstance(base, XBDPairDataset):
+            raise TrainingError("Unsupported subset base dataset for sampler.")
+        return base.samples.iloc[list(dataset.indices)].reset_index(drop=True)
+    if isinstance(dataset, XBDPairDataset):
+        return dataset.samples.reset_index(drop=True)
+    raise TrainingError("Unsupported dataset type for sampler.")
+
+
+def row_damage_ratio(row: dict[str, object]) -> float:
+    value = row.get("damage_ratio")
+    if value is not None and not pd.isna(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+
+    counts_json = row.get("target_value_counts")
+    total_pixels_value = row.get("target_total_pixels")
+    if counts_json is None or total_pixels_value is None or pd.isna(counts_json):
+        return 0.0
+
+    try:
+        counts = json.loads(str(counts_json))
+        total_pixels = int(float(total_pixels_value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 0.0
+    if not isinstance(counts, dict) or total_pixels <= 0:
+        return 0.0
+
+    damage_pixels = 0
+    for raw_class, raw_count in counts.items():
+        try:
+            target_class = int(float(str(raw_class).strip()))
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if target_class in DAMAGE_CLASSES:
+            damage_pixels += count
+    return damage_pixels / total_pixels
 
 
 def parameter_count(model: torch.nn.Module) -> int:
@@ -445,6 +582,9 @@ def train(args: argparse.Namespace) -> None:
         args.image_size,
         args.target_mode,
         args.max_train_samples,
+        augment_mode=args.augment_mode,
+        augment_prob=args.augment_prob,
+        damage_augment_threshold=args.damage_augment_threshold,
     )
     val_dataset = make_dataset(
         args.root,
@@ -452,18 +592,28 @@ def train(args: argparse.Namespace) -> None:
         args.image_size,
         args.target_mode,
         args.max_val_samples,
+        augment_mode="none",
+        augment_prob=0.0,
+        damage_augment_threshold=args.damage_augment_threshold,
     )
     if len(train_dataset) == 0:
         raise TrainingError("Training dataset is empty.")
     if len(val_dataset) == 0:
         raise TrainingError("Validation dataset is empty.")
 
+    train_sampler = make_train_sampler(
+        train_dataset,
+        args.sampler,
+        args.damage_sampling_alpha,
+        args.high_damage_threshold,
+    )
     train_loader = make_loader(
         train_dataset,
         args.batch_size,
         args.num_workers,
-        shuffle=True,
+        shuffle=train_sampler is None,
         device=device,
+        sampler=train_sampler,
     )
     val_loader = make_loader(
         val_dataset,
@@ -495,6 +645,12 @@ def train(args: argparse.Namespace) -> None:
     print(f"Model parameters: {parameter_count(model):,}")
     print(f"Loss: {loss_config['loss']}")
     print(f"Class weights: {loss_config['class_weights'] or 'none'}")
+    print(f"Augment mode: {args.augment_mode}")
+    print(f"Augment probability: {args.augment_prob}")
+    print(f"Damage augment threshold: {args.damage_augment_threshold}")
+    print(f"Sampler: {args.sampler}")
+    print(f"Damage sampling alpha: {args.damage_sampling_alpha}")
+    print(f"High damage threshold: {args.high_damage_threshold}")
 
     best_mean_iou = -1.0
     history: list[dict[str, object]] = []
@@ -530,6 +686,9 @@ def train(args: argparse.Namespace) -> None:
             "epoch_seconds": time.time() - epoch_start,
             "loss": loss_config["loss"],
             "class_weights": loss_config["class_weights"],
+            "augment_mode": args.augment_mode,
+            "augment_prob": args.augment_prob,
+            "sampler": args.sampler,
         }
         history.append(epoch_metrics)
         print_epoch_summary(epoch_metrics)

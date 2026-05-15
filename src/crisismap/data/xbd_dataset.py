@@ -14,6 +14,8 @@ from PIL import Image
 
 REQUIRED_COLUMNS = {"pair_id", "pre_image", "post_image", "target"}
 TARGET_MODES = {"3-class", "5-class"}
+AUGMENT_MODES = {"none", "safe", "damage-aware"}
+DAMAGE_CLASSES = {2, 3, 4}
 
 
 class XBDDatasetError(Exception):
@@ -29,11 +31,20 @@ class XBDPairDataset(torch.utils.data.Dataset):
         split_csv: str | Path,
         image_size: int = 512,
         target_mode: str = "3-class",
+        augment_mode: str = "none",
+        augment_prob: float = 0.0,
+        damage_augment_threshold: float = 0.001,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.split_csv = Path(split_csv).expanduser().resolve()
         self.image_size = validate_image_size(image_size)
         self.target_mode = validate_target_mode(target_mode)
+        self.augment_mode = validate_augment_mode(augment_mode)
+        self.augment_prob = validate_probability(augment_prob, "augment_prob")
+        self.damage_augment_threshold = validate_nonnegative_float(
+            damage_augment_threshold,
+            "damage_augment_threshold",
+        )
         self.samples = load_split_csv(self.split_csv)
 
         if not self.root.exists():
@@ -60,6 +71,16 @@ class XBDPairDataset(torch.utils.data.Dataset):
         post_image = load_rgb_image(post_path, self.image_size)
         target_mask = load_target_mask(target_path, self.image_size)
         target_mask = convert_target_mode(target_mask, self.target_mode)
+        damage_ratio = sample_damage_ratio(row)
+        pre_image, post_image, target_mask = maybe_augment_sample(
+            pre_image,
+            post_image,
+            target_mask,
+            damage_ratio=damage_ratio,
+            augment_mode=self.augment_mode,
+            augment_prob=self.augment_prob,
+            damage_augment_threshold=self.damage_augment_threshold,
+        )
 
         image = np.concatenate([pre_image, post_image], axis=2)
         image_tensor = torch.from_numpy(image.transpose(2, 0, 1).copy())
@@ -92,6 +113,34 @@ def validate_target_mode(target_mode: str) -> str:
             "target_mode must be one of: " + ", ".join(sorted(TARGET_MODES))
         )
     return target_mode
+
+
+def validate_augment_mode(augment_mode: str) -> str:
+    if augment_mode not in AUGMENT_MODES:
+        raise XBDDatasetError(
+            "augment_mode must be one of: " + ", ".join(sorted(AUGMENT_MODES))
+        )
+    return augment_mode
+
+
+def validate_probability(value: float, name: str) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise XBDDatasetError(f"{name} must be a float between 0 and 1.") from exc
+    if not 0.0 <= value <= 1.0:
+        raise XBDDatasetError(f"{name} must be between 0 and 1.")
+    return value
+
+
+def validate_nonnegative_float(value: float, name: str) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise XBDDatasetError(f"{name} must be a non-negative float.") from exc
+    if value < 0.0:
+        raise XBDDatasetError(f"{name} must be non-negative.")
+    return value
 
 
 def load_split_csv(split_csv: Path) -> pd.DataFrame:
@@ -226,6 +275,118 @@ def validate_known_target_values(mask: np.ndarray) -> None:
             "Target mask contains values outside expected xBD classes 0-4: "
             + ", ".join(str(value) for value in unknown_values[:10])
         )
+
+
+def sample_damage_ratio(row: pd.Series) -> float:
+    if "damage_ratio" in row.index and not pd.isna(row["damage_ratio"]):
+        try:
+            return float(row["damage_ratio"])
+        except (TypeError, ValueError):
+            return 0.0
+
+    if {"target_value_counts", "target_total_pixels"}.issubset(row.index):
+        return compute_damage_ratio(
+            row["target_value_counts"],
+            row["target_total_pixels"],
+        )
+    return 0.0
+
+
+def compute_damage_ratio(counts_json: object, total_pixels_value: object) -> float:
+    if pd.isna(counts_json):
+        return 0.0
+    try:
+        counts = json_loads_dict(counts_json)
+        total_pixels = int(float(total_pixels_value))
+    except (TypeError, ValueError):
+        return 0.0
+    if total_pixels <= 0:
+        return 0.0
+
+    damage_pixels = 0
+    for raw_class, raw_count in counts.items():
+        try:
+            target_class = int(float(str(raw_class).strip()))
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if target_class in DAMAGE_CLASSES:
+            damage_pixels += count
+    return damage_pixels / total_pixels
+
+
+def json_loads_dict(value: object) -> dict[object, object]:
+    import json
+
+    parsed = json.loads(str(value))
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def maybe_augment_sample(
+    pre_image: np.ndarray,
+    post_image: np.ndarray,
+    target_mask: np.ndarray,
+    damage_ratio: float,
+    augment_mode: str,
+    augment_prob: float,
+    damage_augment_threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if augment_mode == "none" or augment_prob <= 0.0:
+        return pre_image, post_image, target_mask
+
+    probability = augment_prob
+    if augment_mode == "damage-aware" and damage_ratio <= damage_augment_threshold:
+        probability = augment_prob * 0.5
+
+    if np.random.random() >= probability:
+        return pre_image, post_image, target_mask
+
+    pre_image, post_image, target_mask = apply_geometric_augmentation(
+        pre_image,
+        post_image,
+        target_mask,
+    )
+    pre_image = apply_photometric_augmentation(pre_image)
+    post_image = apply_photometric_augmentation(post_image)
+    return pre_image, post_image, target_mask
+
+
+def apply_geometric_augmentation(
+    pre_image: np.ndarray,
+    post_image: np.ndarray,
+    target_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if np.random.random() < 0.5:
+        pre_image = np.flip(pre_image, axis=1)
+        post_image = np.flip(post_image, axis=1)
+        target_mask = np.flip(target_mask, axis=1)
+    if np.random.random() < 0.5:
+        pre_image = np.flip(pre_image, axis=0)
+        post_image = np.flip(post_image, axis=0)
+        target_mask = np.flip(target_mask, axis=0)
+
+    rotations = int(np.random.randint(0, 4))
+    if rotations:
+        pre_image = np.rot90(pre_image, k=rotations, axes=(0, 1))
+        post_image = np.rot90(post_image, k=rotations, axes=(0, 1))
+        target_mask = np.rot90(target_mask, k=rotations, axes=(0, 1))
+
+    return pre_image, post_image, target_mask
+
+
+def apply_photometric_augmentation(image: np.ndarray) -> np.ndarray:
+    image_float = image.astype(np.float32)
+    brightness = np.random.uniform(0.95, 1.05)
+    contrast = np.random.uniform(0.95, 1.05)
+    channel_mean = image_float.mean(axis=(0, 1), keepdims=True)
+    image_float = (image_float - channel_mean) * contrast + channel_mean
+    image_float = image_float * brightness
+
+    if np.random.random() < 0.3:
+        noise = np.random.normal(loc=0.0, scale=2.0, size=image_float.shape)
+        image_float = image_float + noise
+
+    return np.clip(image_float, 0, 255).astype(np.uint8)
 
 
 def parse_args() -> argparse.Namespace:
