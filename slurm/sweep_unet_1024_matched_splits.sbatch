@@ -8,6 +8,10 @@
 #SBATCH --time=08:00:00
 #SBATCH --output=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.out
 #SBATCH --error=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.err
+#SBATCH --mail-user=t.gourjault@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT
+
+# Email notifications to avoid frequent scheduler polling
 
 # Matched-damage 1024 U-Net sweep on one H100 GPU.
 # To force reruns: sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024_matched_splits.sbatch

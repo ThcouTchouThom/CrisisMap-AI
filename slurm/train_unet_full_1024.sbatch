@@ -8,6 +8,10 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.out
 #SBATCH --error=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.err
+#SBATCH --mail-user=t.gourjault@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT
+
+# Email notifications to avoid frequent scheduler polling
 
 # First serious Alliance/Rorqual U-Net baseline:
 # 1024x1024, full-data splits, 100 epochs, weighted CE + Dice.

@@ -8,6 +8,10 @@
 #SBATCH --time=00:30:00
 #SBATCH --output=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.out
 #SBATCH --error=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.err
+#SBATCH --mail-user=t.gourjault@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT
+
+# Email notifications to avoid frequent scheduler polling
 
 # Technical smoke test only. Adjust account, partition, qos, time, or memory
 # if your allocation requires different settings.
