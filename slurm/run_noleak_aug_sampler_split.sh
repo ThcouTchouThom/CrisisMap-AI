@@ -1,23 +1,4 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=aftermath_splits100
-#SBATCH --account=def-zonata_gpu
-#SBATCH --partition=gpubase_bygpu_b2
-#SBATCH --gres=gpu:h100:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=96G
-#SBATCH --time=08:00:00
-#SBATCH --output=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.out
-#SBATCH --error=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.err
-#SBATCH --mail-user=t.gourjault@gmail.com
-#SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT
-
-# Email notifications to avoid frequent scheduler polling
-
-# No-leak split sweep for 1024 U-Net.
-# Not recommended as a single submission now that the split list is large.
-# Prefer the smaller part scripts for better fit with Rorqual time limits.
-# Force all reruns: sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024_noleak_splits_100epochs.sbatch
-# Retry only incomplete folders: sbatch --export=ALL,FORCE_INCOMPLETE=1 slurm/sweep_unet_1024_noleak_splits_100epochs.sbatch
 
 set -euo pipefail
 cd "${HOME}/work/CrisisMap-AI"
@@ -39,38 +20,31 @@ FORCE="${FORCE:-0}"
 FORCE_INCOMPLETE="${FORCE_INCOMPLETE:-0}"
 JOB_ID="${SLURM_JOB_ID:-manual}"
 
+TARGET_SPLIT="${TARGET_SPLIT:?Set TARGET_SPLIT to a data/processed split directory name.}"
+SPLIT_ALIAS="${SPLIT_ALIAS:-${TARGET_SPLIT#splits_noleak_}}"
+PART_SUMMARY_CSV="${PART_SUMMARY_CSV:?Set PART_SUMMARY_CSV to the split-specific summary path.}"
+
 IMAGE_SIZE="${IMAGE_SIZE:-1024}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 LOSS="${LOSS:-ce-dice}"
 CLASS_WEIGHTS="${CLASS_WEIGHTS:-0.05 1.0 4.0}"
 LR="${LR:-1e-4}"
 EPOCHS="${EPOCHS:-100}"
-AUGMENT_MODE="${AUGMENT_MODE:-none}"
 AUGMENT_PROB="${AUGMENT_PROB:-0.5}"
 DAMAGE_AUGMENT_THRESHOLD="${DAMAGE_AUGMENT_THRESHOLD:-0.001}"
-SAMPLER="${SAMPLER:-none}"
-DAMAGE_SAMPLING_ALPHA="${DAMAGE_SAMPLING_ALPHA:-4.0}"
-HIGH_DAMAGE_THRESHOLD="${HIGH_DAMAGE_THRESHOLD:-0.02}"
-SUMMARY_CSV="outputs/predictions/unet_1024_noleak_splits_100epochs_summary.csv"
-PART_SUMMARY_CSV="${PART_SUMMARY_CSV:-}"
+HIGH_DAMAGE_THRESHOLD="${HIGH_DAMAGE_THRESHOLD:-0.06}"
+SUMMARY_CSV="outputs/predictions/unet_1024_noleak_aug_sampler_100epochs_summary.csv"
 
-SPLITS=(
-  "splits_noleak_full_train"
-  "splits_noleak_full_balanced_damage"
-  "splits_noleak_match_hist1000"
-  "splits_noleak_match_hist1500"
-  "splits_noleak_match_hist_all"
-  "splits_noleak_dmg001_v2"
-  "splits_noleak_damage_heavy"
-  "splits_noleak_high_damage_focus"
-  "splits_noleak_disaster_stratified_150"
-  "splits_noleak_disaster_stratified_200"
-  "splits_noleak_building_rich_002"
-  "splits_noleak_building_rich_003"
+COMBOS=(
+  "none|none|4"
+  "safe|none|4"
+  "damage-aware|none|4"
+  "none|damage-simple|4"
+  "safe|damage-simple|4"
+  "damage-aware|damage-simple|4"
+  "safe|damage-sqrt|4"
+  "damage-aware|damage-sqrt|4"
 )
-if [ -n "${NOLEAK_SPLITS:-}" ]; then
-  read -r -a SPLITS <<< "$NOLEAK_SPLITS"
-fi
 
 split_has_files() {
   local split_dir="$1"
@@ -79,30 +53,16 @@ split_has_files() {
     [ -f "data/processed/${split_dir}/test_pairs.csv" ]
 }
 
-ensure_splits() {
-  if [ ! -f "data/processed/xbd_train_index.csv" ] || ! split_has_files "splits_full"; then
-    echo "Missing index or common splits. Run: bash slurm/setup_rorqual.sh" >&2
+ensure_split() {
+  if [ ! -f "data/processed/splits_full/test_pairs.csv" ]; then
+    echo "Missing common test split: data/processed/splits_full/test_pairs.csv" >&2
     return 1
   fi
-
-  for split_dir in "${SPLITS[@]}"; do
-    if ! split_has_files "$split_dir"; then
-      echo "Advanced no-leak splits missing; creating them."
-      python scripts/create_advanced_noleak_train_splits.py \
-        --index data/processed/xbd_train_index.csv \
-        --common-split-dir data/processed/splits_full \
-        --output-root data/processed \
-        --seed 42
-      break
-    fi
-  done
-
-  for split_dir in "${SPLITS[@]}"; do
-    if ! split_has_files "$split_dir"; then
-      echo "Missing split files after creation: data/processed/${split_dir}" >&2
-      return 1
-    fi
-  done
+  if ! split_has_files "$TARGET_SPLIT"; then
+    echo "Missing split files: data/processed/${TARGET_SPLIT}" >&2
+    echo "Create advanced no-leak splits before launching this job." >&2
+    return 1
+  fi
 }
 
 history_complete() {
@@ -136,13 +96,36 @@ sys.exit(0)
 PY
 }
 
+alpha_label() {
+  local alpha="$1"
+  if [[ "$alpha" == *.* ]]; then
+    python - "$alpha" <<'PY'
+import sys
+value = float(sys.argv[1])
+if value.is_integer():
+    print(int(value))
+else:
+    print(str(sys.argv[1]).replace(".", "p"))
+PY
+  else
+    echo "$alpha"
+  fi
+}
+
 experiment_name() {
-  local split_dir="$1"
-  echo "unet_${IMAGE_SIZE}_${split_dir}_${EPOCHS}epochs_aug-${AUGMENT_MODE}_sampler-${SAMPLER}"
+  local augment_mode="$1"
+  local sampler="$2"
+  local alpha="$3"
+  local name
+  name="unet_${IMAGE_SIZE}_aug_noleak_${SPLIT_ALIAS}_${EPOCHS}epochs_aug-${augment_mode}_sampler-${sampler}"
+  if [ "$sampler" = "damage-sqrt" ]; then
+    name="${name}-alpha$(alpha_label "$alpha")"
+  fi
+  echo "$name"
 }
 
 rebuild_summary() {
-  python scripts/rebuild_noleak_splits_summary.py \
+  python scripts/rebuild_noleak_aug_sampler_summary.py \
     --output "$SUMMARY_CSV" \
     --image-size "$IMAGE_SIZE" \
     --batch-size "$BATCH_SIZE" \
@@ -150,26 +133,28 @@ rebuild_summary() {
     --class-weights "$CLASS_WEIGHTS" \
     --lr "$LR" \
     --epochs "$EPOCHS" \
-    --augment-mode "$AUGMENT_MODE" \
-    --sampler "$SAMPLER"
+    --augment-prob "$AUGMENT_PROB" \
+    --damage-augment-threshold "$DAMAGE_AUGMENT_THRESHOLD" \
+    --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD"
 
-  if [ -n "$PART_SUMMARY_CSV" ]; then
-    python scripts/rebuild_noleak_splits_summary.py \
-      --output "$PART_SUMMARY_CSV" \
-      --splits "${SPLITS[@]}" \
-      --image-size "$IMAGE_SIZE" \
-      --batch-size "$BATCH_SIZE" \
-      --loss "$LOSS" \
-      --class-weights "$CLASS_WEIGHTS" \
-      --lr "$LR" \
-      --epochs "$EPOCHS" \
-      --augment-mode "$AUGMENT_MODE" \
-      --sampler "$SAMPLER"
-  fi
+  python scripts/rebuild_noleak_aug_sampler_summary.py \
+    --output "$PART_SUMMARY_CSV" \
+    --splits "$TARGET_SPLIT" \
+    --image-size "$IMAGE_SIZE" \
+    --batch-size "$BATCH_SIZE" \
+    --loss "$LOSS" \
+    --class-weights "$CLASS_WEIGHTS" \
+    --lr "$LR" \
+    --epochs "$EPOCHS" \
+    --augment-prob "$AUGMENT_PROB" \
+    --damage-augment-threshold "$DAMAGE_AUGMENT_THRESHOLD" \
+    --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD"
 }
 
-train_and_eval_split() {
-  local split_dir="$1"
+train_and_eval() {
+  local augment_mode="$1"
+  local sampler="$2"
+  local alpha="$3"
   local name
   local output_dir
   local history_json
@@ -177,7 +162,7 @@ train_and_eval_split() {
   local metrics_json
   local weights_array
 
-  name="$(experiment_name "$split_dir")"
+  name="$(experiment_name "$augment_mode" "$sampler" "$alpha")"
   output_dir="outputs/checkpoints/${name}"
   history_json="${output_dir}/metrics_history.json"
   checkpoint="${output_dir}/best_unet.pt"
@@ -185,8 +170,8 @@ train_and_eval_split() {
   read -r -a weights_array <<< "$CLASS_WEIGHTS"
 
   echo
-  echo "==> Split: ${split_dir}"
-  echo "experiment=${name}"
+  echo "==> ${name}"
+  echo "split=${TARGET_SPLIT} augment_mode=${augment_mode} sampler=${sampler} alpha=${alpha}"
 
   if [ "$FORCE" = "1" ]; then
     rm -rf -- "$output_dir"
@@ -211,8 +196,8 @@ train_and_eval_split() {
   if ! history_complete "$history_json" "$EPOCHS"; then
     python -m src.crisismap.training.train_unet \
       --root data/raw/xbd/train \
-      --train-csv "data/processed/${split_dir}/train_pairs.csv" \
-      --val-csv "data/processed/${split_dir}/val_pairs.csv" \
+      --train-csv "data/processed/${TARGET_SPLIT}/train_pairs.csv" \
+      --val-csv "data/processed/${TARGET_SPLIT}/val_pairs.csv" \
       --output-dir "$output_dir" \
       --image-size "$IMAGE_SIZE" \
       --batch-size "$BATCH_SIZE" \
@@ -222,18 +207,23 @@ train_and_eval_split() {
       --class-weights "${weights_array[@]}" \
       --lr "$LR" \
       --num-workers 8 \
-      --augment-mode "$AUGMENT_MODE" \
+      --augment-mode "$augment_mode" \
       --augment-prob "$AUGMENT_PROB" \
       --damage-augment-threshold "$DAMAGE_AUGMENT_THRESHOLD" \
-      --sampler "$SAMPLER" \
-      --damage-sampling-alpha "$DAMAGE_SAMPLING_ALPHA" \
+      --sampler "$sampler" \
+      --damage-sampling-alpha "$alpha" \
       --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD"
+  fi
+
+  if ! history_complete "$history_json" "$EPOCHS" || [ ! -f "$checkpoint" ]; then
+    echo "ERROR: Run did not complete cleanly; refusing to evaluate partial checkpoint." >&2
+    return 1
   fi
 
   if [ ! -f "$metrics_json" ]; then
     python -m src.crisismap.evaluation.evaluate_unet \
       --root data/raw/xbd/train \
-      --split-csv "data/processed/${split_dir}/test_pairs.csv" \
+      --split-csv data/processed/splits_full/test_pairs.csv \
       --checkpoint "$checkpoint" \
       --output "$metrics_json" \
       --image-size "$IMAGE_SIZE" \
@@ -243,21 +233,22 @@ train_and_eval_split() {
   fi
 }
 
-ensure_splits
+ensure_split
 
-echo "No-leak split sweep"
+echo "No-leak augmentation/sampler campaign"
+echo "TARGET_SPLIT=${TARGET_SPLIT} SPLIT_ALIAS=${SPLIT_ALIAS}"
 echo "IMAGE_SIZE=${IMAGE_SIZE} BATCH_SIZE=${BATCH_SIZE} LOSS=${LOSS} LR=${LR} EPOCHS=${EPOCHS}"
-echo "AUGMENT_MODE=${AUGMENT_MODE} SAMPLER=${SAMPLER}"
+echo "AUGMENT_PROB=${AUGMENT_PROB} DAMAGE_AUGMENT_THRESHOLD=${DAMAGE_AUGMENT_THRESHOLD}"
+echo "HIGH_DAMAGE_THRESHOLD=${HIGH_DAMAGE_THRESHOLD}"
 echo "FORCE=${FORCE} FORCE_INCOMPLETE=${FORCE_INCOMPLETE}"
 echo "Global summary: ${SUMMARY_CSV}"
-if [ -n "$PART_SUMMARY_CSV" ]; then
-  echo "Part summary: ${PART_SUMMARY_CSV}"
-fi
+echo "Part summary: ${PART_SUMMARY_CSV}"
 
-for split_dir in "${SPLITS[@]}"; do
-  name="$(experiment_name "$split_dir")"
+for combo in "${COMBOS[@]}"; do
+  IFS="|" read -r augment_mode sampler alpha <<< "$combo"
+  name="$(experiment_name "$augment_mode" "$sampler" "$alpha")"
   run_log="${HOME}/scratch/CrisisMap-AI/run_logs/${name}-${JOB_ID}.log"
-  train_and_eval_split "$split_dir" 2>&1 | tee "$run_log"
+  train_and_eval "$augment_mode" "$sampler" "$alpha" 2>&1 | tee "$run_log"
   rebuild_summary
 done
 

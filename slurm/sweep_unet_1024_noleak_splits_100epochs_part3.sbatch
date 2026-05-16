@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
-#SBATCH --time=08:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.out
 #SBATCH --error=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.err
 #SBATCH --mail-user=t.gourjault@gmail.com
