@@ -14,7 +14,8 @@
 # Email notifications to avoid frequent scheduler polling
 
 # No-leak split sweep for 1024 U-Net.
-# Force reruns: sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024_noleak_splits_100epochs.sbatch
+# Force all reruns: sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024_noleak_splits_100epochs.sbatch
+# Retry only incomplete folders: sbatch --export=ALL,FORCE_INCOMPLETE=1 slurm/sweep_unet_1024_noleak_splits_100epochs.sbatch
 
 set -euo pipefail
 cd "${HOME}/work/CrisisMap-AI"
@@ -33,6 +34,7 @@ mkdir -p "${TRITON_CACHE_DIR}" "${HOME}/scratch/CrisisMap-AI/run_logs"
 mkdir -p outputs/checkpoints outputs/predictions
 
 FORCE="${FORCE:-0}"
+FORCE_INCOMPLETE="${FORCE_INCOMPLETE:-0}"
 JOB_ID="${SLURM_JOB_ID:-manual}"
 
 IMAGE_SIZE="${IMAGE_SIZE:-1024}"
@@ -48,6 +50,7 @@ SAMPLER="${SAMPLER:-none}"
 DAMAGE_SAMPLING_ALPHA="${DAMAGE_SAMPLING_ALPHA:-4.0}"
 HIGH_DAMAGE_THRESHOLD="${HIGH_DAMAGE_THRESHOLD:-0.02}"
 SUMMARY_CSV="outputs/predictions/unet_1024_noleak_splits_100epochs_summary.csv"
+PART_SUMMARY_CSV="${PART_SUMMARY_CSV:-}"
 
 SPLITS=(
   "splits_noleak_full_train"
@@ -61,6 +64,9 @@ SPLITS=(
   "splits_noleak_building_rich_002"
   "splits_noleak_building_rich_003"
 )
+if [ -n "${NOLEAK_SPLITS:-}" ]; then
+  read -r -a SPLITS <<< "$NOLEAK_SPLITS"
+fi
 
 split_has_files() {
   local split_dir="$1"
@@ -131,6 +137,33 @@ experiment_name() {
   echo "unet_${IMAGE_SIZE}_${split_dir}_${EPOCHS}epochs_aug-${AUGMENT_MODE}_sampler-${SAMPLER}"
 }
 
+rebuild_summary() {
+  python scripts/rebuild_noleak_splits_summary.py \
+    --output "$SUMMARY_CSV" \
+    --image-size "$IMAGE_SIZE" \
+    --batch-size "$BATCH_SIZE" \
+    --loss "$LOSS" \
+    --class-weights "$CLASS_WEIGHTS" \
+    --lr "$LR" \
+    --epochs "$EPOCHS" \
+    --augment-mode "$AUGMENT_MODE" \
+    --sampler "$SAMPLER"
+
+  if [ -n "$PART_SUMMARY_CSV" ]; then
+    python scripts/rebuild_noleak_splits_summary.py \
+      --output "$PART_SUMMARY_CSV" \
+      --splits "${SPLITS[@]}" \
+      --image-size "$IMAGE_SIZE" \
+      --batch-size "$BATCH_SIZE" \
+      --loss "$LOSS" \
+      --class-weights "$CLASS_WEIGHTS" \
+      --lr "$LR" \
+      --epochs "$EPOCHS" \
+      --augment-mode "$AUGMENT_MODE" \
+      --sampler "$SAMPLER"
+  fi
+}
+
 train_and_eval_split() {
   local split_dir="$1"
   local name
@@ -160,9 +193,13 @@ train_and_eval_split() {
   elif [ -d "$output_dir" ]; then
     if history_complete "$history_json" "$EPOCHS" && [ -f "$checkpoint" ]; then
       echo "Training complete; evaluating missing metrics."
+    elif [ "$FORCE_INCOMPLETE" = "1" ]; then
+      echo "FORCE_INCOMPLETE=1: removing incomplete output before retraining."
+      rm -rf -- "$output_dir"
+      rm -f -- "$metrics_json"
     else
       echo "WARNING: Incomplete output folder, not evaluating partial checkpoint: $output_dir"
-      echo "WARNING: Relaunch with FORCE=1 to retrain."
+      echo "WARNING: Relaunch with FORCE_INCOMPLETE=1 to retrain only incomplete runs."
       return 0
     fi
   fi
@@ -207,124 +244,17 @@ ensure_splits
 echo "No-leak split sweep"
 echo "IMAGE_SIZE=${IMAGE_SIZE} BATCH_SIZE=${BATCH_SIZE} LOSS=${LOSS} LR=${LR} EPOCHS=${EPOCHS}"
 echo "AUGMENT_MODE=${AUGMENT_MODE} SAMPLER=${SAMPLER}"
+echo "FORCE=${FORCE} FORCE_INCOMPLETE=${FORCE_INCOMPLETE}"
+echo "Global summary: ${SUMMARY_CSV}"
+if [ -n "$PART_SUMMARY_CSV" ]; then
+  echo "Part summary: ${PART_SUMMARY_CSV}"
+fi
 
 for split_dir in "${SPLITS[@]}"; do
   name="$(experiment_name "$split_dir")"
   run_log="${HOME}/scratch/CrisisMap-AI/run_logs/${name}-${JOB_ID}.log"
   train_and_eval_split "$split_dir" 2>&1 | tee "$run_log"
+  rebuild_summary
 done
 
-IMAGE_SIZE="$IMAGE_SIZE" \
-BATCH_SIZE="$BATCH_SIZE" \
-LOSS="$LOSS" \
-CLASS_WEIGHTS="$CLASS_WEIGHTS" \
-LR="$LR" \
-EPOCHS="$EPOCHS" \
-AUGMENT_MODE="$AUGMENT_MODE" \
-SAMPLER="$SAMPLER" \
-python - <<'PY'
-import csv
-import json
-import os
-from pathlib import Path
-
-splits = [
-    "splits_noleak_full_train",
-    "splits_noleak_full_balanced_damage",
-    "splits_noleak_match_hist1500",
-    "splits_noleak_match_hist_all",
-    "splits_noleak_dmg001_v2",
-    "splits_noleak_damage_heavy",
-    "splits_noleak_disaster_stratified_150",
-    "splits_noleak_disaster_stratified_200",
-    "splits_noleak_building_rich_002",
-    "splits_noleak_building_rich_003",
-]
-image_size = os.environ["IMAGE_SIZE"]
-batch_size = os.environ["BATCH_SIZE"]
-loss = os.environ["LOSS"]
-class_weights = os.environ["CLASS_WEIGHTS"]
-lr = os.environ["LR"]
-epochs = os.environ["EPOCHS"]
-augment_mode = os.environ["AUGMENT_MODE"]
-sampler = os.environ["SAMPLER"]
-
-
-def class_value(metrics, key, index):
-    values = metrics.get(key, [])
-    if not isinstance(values, list) or len(values) <= index:
-        return None
-    return values[index]
-
-
-rows = []
-for split in splits:
-    experiment = f"unet_{image_size}_{split}_{epochs}epochs_aug-{augment_mode}_sampler-{sampler}"
-    metrics_path = Path("outputs/predictions") / f"{experiment}_test_metrics.json"
-    checkpoint_path = Path("outputs/checkpoints") / experiment / "best_unet.pt"
-    if not metrics_path.exists():
-        print(f"Skipping summary row; missing metrics: {metrics_path}")
-        continue
-    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-    rows.append({
-        "experiment": experiment,
-        "split": split,
-        "image_size": image_size,
-        "batch_size": batch_size,
-        "loss": loss,
-        "class_weights": class_weights,
-        "lr": lr,
-        "epochs": epochs,
-        "augment_mode": augment_mode,
-        "sampler": sampler,
-        "test_pixel_accuracy": metrics.get("pixel_accuracy"),
-        "test_mean_iou": metrics.get("mean_iou"),
-        "test_iou_background": class_value(metrics, "iou_per_class", 0),
-        "test_iou_no_damage": class_value(metrics, "iou_per_class", 1),
-        "test_iou_damaged": class_value(metrics, "iou_per_class", 2),
-        "test_precision_damaged": class_value(metrics, "precision_per_class", 2),
-        "test_recall_damaged": class_value(metrics, "recall_per_class", 2),
-        "test_f1_damaged": class_value(metrics, "f1_per_class", 2),
-        "checkpoint": str(checkpoint_path),
-        "test_metrics_json": str(metrics_path),
-    })
-rows.sort(
-    key=lambda row: (
-        row["test_iou_damaged"] if row["test_iou_damaged"] is not None else -1,
-        row["test_f1_damaged"] if row["test_f1_damaged"] is not None else -1,
-        row["test_mean_iou"] if row["test_mean_iou"] is not None else -1,
-    ),
-    reverse=True,
-)
-output = Path("outputs/predictions/unet_1024_noleak_splits_100epochs_summary.csv")
-output.parent.mkdir(parents=True, exist_ok=True)
-fieldnames = [
-    "experiment",
-    "split",
-    "image_size",
-    "batch_size",
-    "loss",
-    "class_weights",
-    "lr",
-    "epochs",
-    "augment_mode",
-    "sampler",
-    "test_pixel_accuracy",
-    "test_mean_iou",
-    "test_iou_background",
-    "test_iou_no_damage",
-    "test_iou_damaged",
-    "test_precision_damaged",
-    "test_recall_damaged",
-    "test_f1_damaged",
-    "checkpoint",
-    "test_metrics_json",
-]
-with output.open("w", newline="", encoding="utf-8") as file:
-    writer = csv.DictWriter(file, fieldnames=fieldnames)
-    writer.writeheader()
-    writer.writerows(rows)
-print(f"Saved summary CSV: {output}")
-for row in rows:
-    print(row["experiment"], row["test_iou_damaged"], row["test_f1_damaged"], row["test_mean_iou"])
-PY
+rebuild_summary
