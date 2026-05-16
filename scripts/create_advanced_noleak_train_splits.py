@@ -341,13 +341,53 @@ def sample_per_disaster(trainable: pd.DataFrame, max_per_disaster: int, seed: in
     return pd.concat(pieces, ignore_index=False).sample(frac=1.0, random_state=seed)
 
 
+def sample_high_damage_focus(
+    trainable: pd.DataFrame,
+    seed: int,
+    primary_threshold: float = 0.02,
+    fallback_threshold: float = 0.005,
+    min_target: int = 500,
+) -> tuple[pd.DataFrame, str]:
+    candidates = trainable[trainable["nonzero_ratio"] >= 0.01].copy()
+    primary = candidates[candidates["damage_ratio"] >= primary_threshold].copy()
+    fallback = candidates[
+        (candidates["damage_ratio"] >= fallback_threshold)
+        & (candidates["damage_ratio"] < primary_threshold)
+    ].copy()
+
+    fallback_used = 0
+    if len(primary) >= min_target:
+        selected = primary
+    else:
+        fallback_used = min(min_target - len(primary), len(fallback))
+        pieces = [primary]
+        if fallback_used > 0:
+            pieces.append(fallback.sample(n=fallback_used, random_state=seed))
+        selected = pd.concat(pieces, ignore_index=False)
+
+    if selected.empty:
+        selected = fallback.copy()
+        fallback_used = len(fallback)
+
+    notes = (
+        f"primary_threshold={primary_threshold}; "
+        f"fallback_threshold={fallback_threshold}; "
+        f"min_target={min_target}; "
+        f"primary_count={len(primary)}; "
+        f"fallback_available={len(fallback)}; "
+        f"fallback_used={fallback_used}; "
+        f"final_count={len(selected)}"
+    )
+    return selected.sample(frac=1.0, random_state=seed), notes
+
+
 def build_splits(
     index_df: pd.DataFrame,
     common_val: pd.DataFrame,
     common_test: pd.DataFrame,
     reference: pd.DataFrame,
     seed: int,
-) -> list[tuple[str, pd.DataFrame]]:
+) -> list[tuple[str, pd.DataFrame, str]]:
     common_ids = set(common_val["pair_id"]) | set(common_test["pair_id"])
     trainable = index_df[~index_df["pair_id"].isin(common_ids)].copy()
     nonzero_trainable = trainable[trainable["nonzero_ratio"] >= 0.01].copy()
@@ -358,28 +398,40 @@ def build_splits(
         (trainable["nonzero_ratio"] >= 0.01) & (trainable["damage_ratio"] <= 0.001)
     ].copy()
 
+    high_damage_focus, high_damage_notes = sample_high_damage_focus(trainable, seed + 30)
+
     return [
-        ("splits_noleak_full_train", trainable),
-        ("splits_noleak_full_balanced_damage", sample_balanced_damage(trainable, seed)),
+        ("splits_noleak_full_train", trainable, ""),
+        ("splits_noleak_full_balanced_damage", sample_balanced_damage(trainable, seed), ""),
+        (
+            "splits_noleak_match_hist1000",
+            sample_histogram(nonzero_trainable, reference, 1000, seed),
+            "histogram_target_size=1000",
+        ),
         (
             "splits_noleak_match_hist1500",
             sample_histogram(nonzero_trainable, reference, 1500, seed),
+            "histogram_target_size=1500",
         ),
         (
             "splits_noleak_match_hist_all",
             sample_histogram(nonzero_trainable, reference, len(nonzero_trainable), seed + 10),
+            f"histogram_target_size={len(nonzero_trainable)}",
         ),
-        ("splits_noleak_dmg001_v2", sample_mix(damaged, low_damage, 0.60, seed)),
-        ("splits_noleak_damage_heavy", sample_mix(damaged, low_damage, 0.80, seed + 20)),
-        ("splits_noleak_disaster_stratified_150", sample_per_disaster(trainable, 150, seed)),
-        ("splits_noleak_disaster_stratified_200", sample_per_disaster(trainable, 200, seed)),
+        ("splits_noleak_dmg001_v2", sample_mix(damaged, low_damage, 0.60, seed), ""),
+        ("splits_noleak_damage_heavy", sample_mix(damaged, low_damage, 0.80, seed + 20), ""),
+        ("splits_noleak_high_damage_focus", high_damage_focus, high_damage_notes),
+        ("splits_noleak_disaster_stratified_150", sample_per_disaster(trainable, 150, seed), ""),
+        ("splits_noleak_disaster_stratified_200", sample_per_disaster(trainable, 200, seed), ""),
         (
             "splits_noleak_building_rich_002",
             trainable[trainable["nonzero_ratio"] >= 0.02].copy(),
+            "nonzero_ratio>=0.02",
         ),
         (
             "splits_noleak_building_rich_003",
             trainable[trainable["nonzero_ratio"] >= 0.03].copy(),
+            "nonzero_ratio>=0.03",
         ),
     ]
 
@@ -387,6 +439,7 @@ def build_splits(
 def write_split(
     name: str,
     train_df: pd.DataFrame,
+    selection_notes: str,
     output_root: Path,
     common_val_path: Path,
     common_test_path: Path,
@@ -407,7 +460,7 @@ def write_split(
     shutil.copyfile(common_val_path, output_dir / "val_pairs.csv")
     shutil.copyfile(common_test_path, output_dir / "test_pairs.csv")
 
-    summary = summary_row(name, train_out, common_val, common_test)
+    summary = summary_row(name, train_out, common_val, common_test, selection_notes)
     pd.DataFrame([summary]).to_csv(output_dir / "split_summary.csv", index=False)
     assert_no_leakage(summary, output_dir)
     return summary
@@ -418,6 +471,7 @@ def summary_row(
     train_df: pd.DataFrame,
     common_val: pd.DataFrame,
     common_test: pd.DataFrame,
+    selection_notes: str,
 ) -> dict[str, object]:
     train_ids = set(train_df["pair_id"].astype(str))
     val_ids = set(common_val["pair_id"].astype(str))
@@ -436,6 +490,7 @@ def summary_row(
     }
     return {
         "split_name": split_name,
+        "selection_notes": selection_notes,
         "train_count": int(len(train_df)),
         "val_count": int(len(common_val)),
         "test_count": int(len(common_test)),
@@ -496,7 +551,7 @@ def create_splits(args: argparse.Namespace) -> None:
 
     output_root = args.output_root.expanduser().resolve()
     rows = []
-    for name, train_df in build_splits(
+    for name, train_df, selection_notes in build_splits(
         index_df,
         common_val,
         common_test,
@@ -507,6 +562,7 @@ def create_splits(args: argparse.Namespace) -> None:
             write_split(
                 name,
                 train_df,
+                selection_notes,
                 output_root,
                 common_val_path,
                 common_test_path,

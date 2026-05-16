@@ -12,10 +12,12 @@ from pathlib import Path
 DEFAULT_SPLITS = [
     "splits_noleak_full_train",
     "splits_noleak_full_balanced_damage",
+    "splits_noleak_match_hist1000",
     "splits_noleak_match_hist1500",
     "splits_noleak_match_hist_all",
     "splits_noleak_dmg001_v2",
     "splits_noleak_damage_heavy",
+    "splits_noleak_high_damage_focus",
     "splits_noleak_disaster_stratified_150",
     "splits_noleak_disaster_stratified_200",
     "splits_noleak_building_rich_002",
