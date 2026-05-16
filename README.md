@@ -1,199 +1,241 @@
-# CrisisMap AI
+# Aftermath
 
-## Project Overview
+**Voir les dégâts pour agir plus vite.**
 
-CrisisMap AI is an academic prototype for disaster damage assessment from paired satellite imagery. It analyzes pre-disaster and post-disaster RGB image pairs from the xBD/xView2 dataset and produces pixel-level damage maps.
+Aftermath, aussi appelé CrisisMap AI dans le code, est un prototype académique de segmentation des dommages aux bâtiments après catastrophe. Le projet utilise des paires d'images satellites avant/après du dataset xBD/xView2 afin de produire des cartes de dommages au niveau pixel.
 
-The current MVP is a 3-class semantic segmentation baseline:
+Équipe : Thomas Gourjault, Aurélien Casagrandi, Grégory Jourdain.
 
-- `0`: background
-- `1`: no damage
-- `2`: damaged
+## Objectif
+
+Le but est de construire une chaîne complète :
+
+```text
+archives xBD/xView2 -> extraction -> index CSV -> splits -> Dataset PyTorch -> U-Net -> métriques -> prototype
+```
+
+Le prototype actuel répond à une formulation de segmentation sémantique à 3 classes :
+
+| Classe | Signification |
+| --- | --- |
+| `0` | background / absence de bâtiment |
+| `1` | bâtiment non endommagé |
+| `2` | bâtiment endommagé |
+
+L'entrée du modèle est un tenseur à 6 canaux : image RGB pré-catastrophe + image RGB post-catastrophe. La segmentation multi-niveaux des dommages, plus proche du format original xBD, est un objectif futur.
 
 ## Dataset
 
-The project uses the xBD/xView2 training set. Raw data is expected locally under:
+Le projet utilise le jeu d'entraînement xBD/xView2. Les données brutes, images extraites, checkpoints et sorties générées ne sont pas versionnés dans Git.
+
+Archives attendues localement :
 
 ```text
-data/raw/xbd/
+data/raw/archives/train_images_labels_targets.tar
+data/raw/archives/xview_geotransforms.json.tgz
 ```
 
-The xBD archive, extracted satellite images, labels, generated masks, model checkpoints, and prediction outputs are not stored in GitHub. Keep raw imagery under `data/raw/`, derived CSVs under `data/processed/`, and generated artifacts under `outputs/`.
-
-## Setup For Teammates
-
-Clone the repository, then place the externally shared xBD/xView2 archives in:
+Structure attendue après extraction :
 
 ```text
-data/raw/archives/
+data/raw/xbd/train/images/
+data/raw/xbd/train/labels/
+data/raw/xbd/train/targets/
+data/raw/geotransforms/xview_geotransforms.json
 ```
 
-Expected files:
+`xview_geotransforms.json` contient des métadonnées de géoréférencement utiles pour replacer plus tard les prédictions sur une carte ou dans un outil GIS. Il est extrait, mais pas encore utilisé dans l'entraînement.
 
-- `data/raw/archives/train_images_labels_targets.tar`
-- `data/raw/archives/xview_geotransforms.json.tgz`
+## Structure du dépôt
 
-Run the Windows PowerShell setup script from the project root:
+```text
+app/                         # Prototype Streamlit.
+configs/                     # Configuration éventuelle des expériences.
+data/                        # Données locales et CSV traités; les données lourdes ne sont pas suivies.
+deliverables/                # Livrables de cours, dont le jalon 2.
+notebooks/                   # Exploration.
+outputs/                     # Checkpoints, figures, métriques; non suivis.
+scripts/                     # Scripts utilitaires locaux et génération de splits.
+slurm/                       # Scripts Alliance / Rorqual.
+src/crisismap/
+  data/                      # Inspection, indexation, splits, Dataset PyTorch.
+  evaluation/                # Évaluation et visualisation de prédictions.
+  models/                    # U-Net.
+  training/                  # Entraînement.
+  visualization/             # Figures dataset et métriques.
+```
+
+## Pipeline de données
+
+Les scripts principaux sont :
+
+- `src/crisismap/data/inspect_xbd.py` : inspection de la structure xBD.
+- `src/crisismap/data/build_xbd_index.py` : construction de `data/processed/xbd_train_index.csv`.
+- `src/crisismap/data/summarize_xbd_index.py` : statistiques exploratoires.
+- `src/crisismap/data/create_xbd_splits.py` : splits simples train/validation/test.
+- `scripts/create_advanced_noleak_train_splits.py` : splits avancés sans fuite de données.
+- `src/crisismap/data/xbd_dataset.py` : Dataset PyTorch 6 canaux.
+
+Le dataset brut contient 2799 paires pré/post. Certains splits filtrent les images avec trop peu d'information bâtiment, notamment avec `min_nonzero_ratio >= 0.01`.
+
+## Méthodologie actuelle
+
+Les premières comparaisons ont révélé un risque de data leakage entre certains splits d'entraînement et un test global. Le protocole actuel utilise donc une validation et un test communs :
+
+```text
+common_val  = data/processed/splits_full/val_pairs.csv
+common_test = data/processed/splits_full/test_pairs.csv
+```
+
+Les nouveaux splits d'entraînement excluent tous les `pair_id` présents dans ces deux fichiers. La validation et le test ne sont pas augmentés et ne sont pas pondérés par sampler.
+
+## Baseline IA
+
+Le baseline est un U-Net léger :
+
+- entrée : 6 canaux, pré RGB + post RGB ;
+- sortie : 3 classes ;
+- perte de référence : Cross-Entropy pondérée + Dice loss ;
+- poids de référence : `[0.05, 1.0, 4.0]` ;
+- expériences réalisées en 512 et 1024 pixels.
+
+Le baseline local 512 a validé toute la chaîne. Les expériences 1024 no-leak sur Rorqual servent à améliorer la classe `damaged`, qui reste la plus difficile et la plus importante.
+
+## Installation locale
+
+Créer un environnement Python puis installer les dépendances :
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Pour une installation complète à partir des archives locales, utiliser le script PowerShell :
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/setup_project.ps1
 ```
 
-To rebuild processed index and split CSV files:
+Pour reconstruire les fichiers traités :
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/setup_project.ps1 -Force
 ```
 
-The script creates `.venv`, installs dependencies, extracts the local archives, validates the dataset, builds `data/processed/xbd_train_index.csv`, and creates split CSVs under `data/processed/splits/`.
+## Commandes utiles
 
-If you received a trained checkpoint, place it at:
+Inspection :
 
-```text
-outputs/checkpoints/unet_baseline_512_v2_30epochs/best_unet.pt
+```powershell
+python src/crisismap/data/inspect_xbd.py --root data/raw/xbd/train
 ```
 
-Run the Streamlit prototype:
+Visualisation d'un échantillon :
+
+```powershell
+python src/crisismap/visualization/visualize_xbd_sample.py --root data/raw/xbd/train --mode 3-class
+```
+
+Indexation :
+
+```powershell
+python src/crisismap/data/build_xbd_index.py --root data/raw/xbd/train --output data/processed/xbd_train_index.csv
+```
+
+Entraînement baseline :
+
+```powershell
+python src/crisismap/training/train_unet.py `
+  --root data/raw/xbd/train `
+  --train-csv data/processed/splits/train_pairs.csv `
+  --val-csv data/processed/splits/val_pairs.csv `
+  --output-dir outputs/checkpoints/unet_baseline `
+  --image-size 512 `
+  --batch-size 2 `
+  --epochs 5 `
+  --target-mode 3-class `
+  --loss ce-dice `
+  --class-weights 0.05 1.0 4.0
+```
+
+Évaluation :
+
+```powershell
+python src/crisismap/evaluation/evaluate_unet.py `
+  --root data/raw/xbd/train `
+  --split-csv data/processed/splits/test_pairs.csv `
+  --checkpoint outputs/checkpoints/unet_baseline/best_unet.pt `
+  --output outputs/predictions/unet_baseline_test_metrics.json `
+  --image-size 512 `
+  --target-mode 3-class
+```
+
+Visualisation d'une prédiction :
+
+```powershell
+python src/crisismap/evaluation/predict_unet_sample.py `
+  --root data/raw/xbd/train `
+  --split-csv data/processed/splits/test_pairs.csv `
+  --checkpoint outputs/checkpoints/unet_baseline/best_unet.pt `
+  --image-size 512 `
+  --target-mode 3-class
+```
+
+## Prototype Streamlit
+
+L'application Streamlit permet de sélectionner un split et une paire d'images, puis d'afficher l'image avant, l'image après, le masque vérité terrain, la prédiction et une superposition sur l'image post-catastrophe.
 
 ```powershell
 streamlit run app/streamlit_app.py
 ```
 
-## MVP Approach
+Le checkpoint utilisé par défaut doit être placé dans `outputs/checkpoints/`. Les checkpoints ne sont pas inclus dans Git.
 
-Each sample combines:
+## Rorqual / SLURM
 
-- pre-disaster RGB image
-- post-disaster RGB image
-- target damage mask
+Les entraînements lourds sont préparés pour Alliance / Calcul Québec, notamment Rorqual H100. Les fichiers utiles sont dans `slurm/` :
 
-The model input is a 6-channel tensor formed by concatenating pre-disaster RGB and post-disaster RGB images. The baseline model is a lightweight U-Net with `7,763,971` trainable parameters.
+- `slurm/setup_rorqual.sh` : installation côté cluster et préparation des données.
+- `slurm/smoke_unet_512.sbatch` : test technique court.
+- `slurm/train_unet_full_1024.sbatch` : entraînement 1024 complet.
+- `slurm/sweep_*.sbatch` : campagnes de splits, augmentation et samplers.
 
-## Current Pipeline
+Les scripts utilisent les répertoires `~/work/CrisisMap-AI` pour le code et `~/scratch/CrisisMap-AI` pour les données, sorties et logs. Ils incluent des notifications courriel pour éviter un polling fréquent du scheduler.
 
-1. Inspect the extracted xBD/xView2 folder structure.
-2. Visualize image pairs, labels, and target masks.
-3. Build a CSV index of valid image pairs.
-4. Summarize class imbalance and disaster distribution.
-5. Create train/val/test split CSVs.
-6. Train a U-Net baseline.
-7. Evaluate the checkpoint on validation or test splits.
-8. Generate prediction visualizations and training metric plots.
+## Livrables
 
-## Results
-
-Training subset:
-
-- train: `565` pairs
-- val: `122` pairs
-- test: `122` pairs
-- disasters: `hurricane-harvey`, `hurricane-michael`, `palu-tsunami`, `santa-rosa-wildfire`
-
-Best training run:
-
-- image size: `512`
-- batch size: `2`
-- epochs: `30`
-- best validation mean IoU: `0.6322` at epoch `29`
-
-Test metrics:
-
-- pixel accuracy: `0.9175`
-- mean IoU: `0.6257`
-- IoU background: `0.9297`
-- IoU no damage: `0.5602`
-- IoU damaged: `0.3870`
-- F1 damaged: `0.5581`
-
-## How To Run Key Scripts
-
-Inspect the dataset:
-
-```powershell
-python .\src\crisismap\data\inspect_xbd.py --root ".\data\raw\xbd\train"
-```
-
-Visualize a sample:
-
-```powershell
-python .\src\crisismap\visualization\visualize_xbd_sample.py --root ".\data\raw\xbd\train" --mode 3-class
-```
-
-Build the dataset index:
-
-```powershell
-python .\src\crisismap\data\build_xbd_index.py --root ".\data\raw\xbd\train" --output ".\data\processed\xbd_train_index.csv"
-```
-
-Summarize the index:
-
-```powershell
-python .\src\crisismap\data\summarize_xbd_index.py --index ".\data\processed\xbd_train_index.csv"
-```
-
-Create split CSVs:
-
-```powershell
-python .\src\crisismap\data\create_xbd_splits.py --index ".\data\processed\xbd_train_index.csv" --output-dir ".\data\processed\splits"
-```
-
-Smoke-test the PyTorch dataset:
-
-```powershell
-python .\src\crisismap\data\xbd_dataset.py --root ".\data\raw\xbd\train" --split-csv ".\data\processed\splits\train_pairs.csv" --num-samples 4
-```
-
-Train the baseline U-Net:
-
-```powershell
-python .\src\crisismap\training\train_unet.py --root ".\data\raw\xbd\train" --train-csv ".\data\processed\splits\train_pairs.csv" --val-csv ".\data\processed\splits\val_pairs.csv" --output-dir ".\outputs\checkpoints\unet_baseline_512_v2_30epochs" --image-size 512 --batch-size 2 --epochs 30 --target-mode 3-class
-```
-
-Evaluate a checkpoint:
-
-```powershell
-python .\src\crisismap\evaluation\evaluate_unet.py --root ".\data\raw\xbd\train" --split-csv ".\data\processed\splits\test_pairs.csv" --checkpoint ".\outputs\checkpoints\unet_baseline_512_v2_30epochs\best_unet.pt" --output ".\outputs\predictions\unet_test_metrics.json" --image-size 512 --target-mode 3-class
-```
-
-Visualize one prediction:
-
-```powershell
-python .\src\crisismap\evaluation\predict_unet_sample.py --root ".\data\raw\xbd\train" --split-csv ".\data\processed\splits\test_pairs.csv" --checkpoint ".\outputs\checkpoints\unet_baseline_512_v2_30epochs\best_unet.pt" --image-size 512 --target-mode 3-class
-```
-
-Plot training metrics:
-
-```powershell
-python .\src\crisismap\visualization\plot_training_metrics.py --metrics ".\outputs\checkpoints\unet_baseline_512_v2_30epochs\metrics_history.json" --output-dir ".\outputs\figures\training_metrics_512_v2"
-```
-
-## Repository Structure
+Le dossier du jalon 2 est ici :
 
 ```text
-CrisisMap AI/
-  app/                         # Prototype UI or demo entry points.
-  configs/                     # Experiment and path configuration files.
-  data/
-    raw/                       # Local xBD/xView2 archive extraction; not committed.
-    processed/                 # Local indexes and split CSVs.
-    samples/                   # Small optional demo samples only.
-  notebooks/                   # Exploratory analysis notebooks.
-  outputs/
-    checkpoints/               # Local model checkpoints; not committed.
-    figures/                   # Local plots and visual summaries.
-    predictions/               # Local metrics and prediction artifacts.
-  src/crisismap/
-    data/                      # Inspection, indexing, splitting, and dataset code.
-    evaluation/                # Evaluation and prediction scripts.
-    models/                    # U-Net model definition.
-    training/                  # U-Net training script.
-    visualization/             # Dataset and metrics visualization scripts.
+deliverables/jalon_2/README_jalon_2.md
 ```
 
-## Next Steps
+Il contient une synthèse en français, des sources NotebookLM, un plan de présentation, des résultats résumés et quelques petites figures.
 
-- Improve damaged-class performance through stronger class balancing or loss functions.
-- Add data augmentation for disaster imagery.
-- Compare against stronger segmentation backbones.
-- Add qualitative error analysis for damaged-building false negatives.
-- Package a small demo workflow using saved predictions and figures.
+## État actuel
+
+Terminé :
+
+- pipeline de données xBD/xView2 ;
+- visualisations ;
+- Dataset PyTorch ;
+- U-Net baseline ;
+- métriques d'évaluation ;
+- protocole no-leak ;
+- scripts SLURM ;
+- prototype Streamlit.
+
+En cours :
+
+- campagne augmentation/sampler train-only ;
+- comparaison des meilleurs splits no-leak ;
+- mise à jour du prototype avec le meilleur checkpoint final.
+
+Étapes futures :
+
+- analyse qualitative des erreurs ;
+- segmentation multi-niveaux des dommages ;
+- exploitation des geotransforms pour une visualisation cartographique ;
+- architectures plus fortes : Siamese U-Net, SegFormer, ChangeFormer, modèles hybrides segmentation/classification.
