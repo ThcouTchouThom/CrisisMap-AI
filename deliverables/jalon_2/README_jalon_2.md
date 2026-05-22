@@ -31,6 +31,24 @@ deliverables/jalon_2/
   slides_draft/                # Plan de présentation 6 à 8 minutes.
 ```
 
+## Contenu final du rendu
+
+- [Note de rendu pour le correcteur](NOTE_RENDU_JALON_2.md)
+- [Dossier de présentation](presentation/)
+- [Synthèse des résultats](results/resultats_synthese_jalon_2.md)
+- [Figures du jalon](figures/)
+- [Sources NotebookLM](notebooklm_sources/)
+
+## Présentation orale
+
+Le PDF final de présentation orale est attendu ici :
+
+```text
+deliverables/jalon_2/presentation/JALON_2_Presentation_Aftermath.pdf
+```
+
+Le dossier `presentation/` contient un README qui précise ce nom de fichier pour le rendu final.
+
 ## Données
 
 Le dataset utilisé est xBD/xView2. Les archives ne sont pas suivies dans Git, car elles sont volumineuses. Elles doivent être placées localement dans :
@@ -179,4 +197,3 @@ Ces scores doivent être présentés comme des résultats en cours d'améliorati
 - Ajouter une analyse qualitative des erreurs.
 - Explorer des architectures plus fortes : Siamese U-Net, SegFormer, ChangeFormer ou modèles hybrides segmentation/classification.
 - Exploiter `xview_geotransforms.json` pour une vraie visualisation cartographique.
-
