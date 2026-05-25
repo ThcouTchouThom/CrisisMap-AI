@@ -21,5 +21,8 @@ ipykernel
 # Geometry helpers for xBD building polygons and labels
 shapely
 
+# Sam2
+sam2
+
 # App
 streamlit
