@@ -56,7 +56,7 @@ outputs/checkpoints/unet_baseline_512_v2_30epochs/best_unet.pt
 To have the SAM2 checkpoint for mask refinement:
 
 ```powershell
-New-Item -ItemType Directory -Force -Path "src\models\sam"
+New-Item -ItemType Directory -Force -Path "src\crisismap\models\sam"
 Invoke-WebRequest -Uri "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt" -OutFile "models\sam\sam_vit_b_01ec64.pth"
 ```
 
