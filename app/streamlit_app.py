@@ -29,15 +29,16 @@ CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "outputs"
     / "checkpoints"
-    / "unet_512_ce_dice_w005_1_4_50epochs"
+    / "unet_baseline"
     / "best_unet.pt"
 )
+SAM_CHECKPOINT_PATH = PROJECT_ROOT / "src" / "crisismap" / "models" / "sam" / "sam_vit_b_01ec64.pth"
 
 IMAGE_SIZE = 512
 TARGET_MODE = "3-class"
 BASE_CHANNELS = 32
 
-CHECKPOINT_LABEL = "unet_512_ce_dice_w005_1_4_50epochs/best_unet.pt"
+CHECKPOINT_LABEL = "unet_baseline/best_unet.pt"
 RECOMMENDED_PAIR_IDS_BY_SPLIT = {
     "train": [
         "hurricane-harvey_00000000",
@@ -121,6 +122,33 @@ def load_model(checkpoint_path: str, device_name: str) -> UNet:
     return model
 
 
+@st.cache_resource(show_spinner="Chargement du modèle SAM")
+def load_sam_refiner(sam_checkpoint_path: str, device_name: str):
+    """Charge le SAMRefiner. Retourne None si SAM n'est pas disponible."""
+    try:
+        from crisismap.models.sam_refiner import SAMRefiner  # noqa: E402
+    except ImportError:
+        st.warning("Le module SAMRefiner est introuvable dans crisismap/models/.")
+        return None
+
+    checkpoint = Path(sam_checkpoint_path)
+    if not checkpoint.exists():
+        st.warning(f"Checkpoint SAM introuvable : `{checkpoint}`")
+        return None
+
+    try:
+        device = torch.device(device_name)
+        return SAMRefiner(
+            checkpoint=str(checkpoint),
+            model_type="configs/sam2.1/sam2.1_hiera_l.yaml",
+            device=device,
+            building_classes={1, 2},
+        )
+    except Exception as exc:
+        st.warning(f"Impossible de charger SAM : {exc}")
+        return None
+
+
 def load_checkpoint_file(path: Path, device: torch.device) -> object:
     try:
         return torch.load(path, map_location=device, weights_only=False)
@@ -167,6 +195,28 @@ def predict(model: UNet, image: torch.Tensor, device_name: str) -> torch.Tensor:
     device = torch.device(device_name)
     logits = model(image.unsqueeze(0).to(device))
     return torch.argmax(logits, dim=1).squeeze(0).cpu()
+
+
+@torch.no_grad()
+def predict_with_sam(
+    model: UNet,
+    image: torch.Tensor,
+    device_name: str,
+    sam_refiner,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Retourne (pred_unet, pred_sam) — deux masques (H, W)."""
+    device = torch.device(device_name)
+    logits = model(image.unsqueeze(0).to(device))
+    unet_pred = torch.argmax(logits, dim=1).squeeze(0).cpu()
+
+    # Image post seule (canaux 3-5) pour SAM
+    post_image = image[3:].unsqueeze(0)  # (1, 3, H, W)
+    sam_pred = sam_refiner.refine_batch(
+        post_images=post_image,
+        unet_preds=unet_pred.unsqueeze(0),
+    ).squeeze(0)
+
+    return unet_pred, sam_pred
 
 
 def tensor_to_rgb(tensor: torch.Tensor) -> np.ndarray:
@@ -225,6 +275,42 @@ def render_model_summary() -> None:
     st.sidebar.write("F1 damaged: `0.5875`")
 
 
+def render_sam_sidebar() -> bool:
+    """Affiche les options SAM dans la sidebar. Retourne True si SAM activé."""
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Raffinement SAM")
+
+    sam_available = SAM_CHECKPOINT_PATH.exists()
+    if not sam_available:
+        st.sidebar.warning(
+            f"Checkpoint SAM introuvable :\n`{SAM_CHECKPOINT_PATH}`\n\n"
+            "Téléchargez-le avec :\n"
+            "```\nwget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+            " -O models/sam/sam_vit_b_01ec64.pth\n```"
+        )
+        return False
+
+    use_sam = st.sidebar.toggle(
+        "Activer SAM",
+        value=False,
+        help=(
+            "Raffine les contours des bâtiments détectés par le U-Net "
+            "à l'aide de Segment Anything Model (SAM ViT-B)."
+        ),
+    )
+
+    if use_sam:
+        st.sidebar.success("SAM activé — les masques seront raffinés.")
+        st.sidebar.caption(
+            "SAM utilise l'image post-catastrophe pour affiner "
+            "les contours de chaque bâtiment détecté par le U-Net."
+        )
+    else:
+        st.sidebar.info("SAM désactivé — prédiction U-Net seule.")
+
+    return use_sam
+
+
 def validate_required_paths() -> None:
     if not DATA_ROOT.exists():
         raise AppError(f"xBD training folder not found: {DATA_ROOT}")
@@ -232,6 +318,93 @@ def validate_required_paths() -> None:
         raise AppError(f"xBD training path is not a directory: {DATA_ROOT}")
     if not SPLITS_DIR.exists():
         raise AppError(f"Split directory not found: {SPLITS_DIR}")
+
+
+def render_metrics_comparison(
+    pred_unet: np.ndarray,
+    pred_sam: np.ndarray | None,
+    target: np.ndarray,
+) -> None:
+    bp_u, dp_u, dr_u = prediction_metrics(pred_unet)
+    metrics_unet = compute_iou_metrics(pred_unet, target)
+
+    if pred_sam is not None:
+        bp_s, dp_s, dr_s = prediction_metrics(pred_sam)
+        metrics_sam = compute_iou_metrics(pred_sam, target)
+
+        st.markdown("#### Métriques de prédiction")
+
+        # Ligne header
+        col_label, col_unet, col_sam = st.columns([1.2, 1, 1])
+        col_label.markdown("&nbsp;")
+        col_unet.markdown("**U-Net seul**")
+        col_sam.markdown("**U-Net + SAM2**")
+
+        rows = [
+            ("Pixel Accuracy",    f"{metrics_unet['pixel_accuracy']:.4f}",  f"{metrics_sam['pixel_accuracy']:.4f}",  metrics_sam['pixel_accuracy']  - metrics_unet['pixel_accuracy']),
+            ("Mean IoU",          f"{metrics_unet['mean_iou']:.4f}",         f"{metrics_sam['mean_iou']:.4f}",         metrics_sam['mean_iou']         - metrics_unet['mean_iou']),
+            ("IoU Background",    f"{metrics_unet['iou_background']:.4f}",   f"{metrics_sam['iou_background']:.4f}",   metrics_sam['iou_background']   - metrics_unet['iou_background']),
+            ("IoU No-Damage",     f"{metrics_unet['iou_no_damage']:.4f}",    f"{metrics_sam['iou_no_damage']:.4f}",    metrics_sam['iou_no_damage']    - metrics_unet['iou_no_damage']),
+            ("IoU Damaged",       f"{metrics_unet['iou_damaged']:.4f}",      f"{metrics_sam['iou_damaged']:.4f}",      metrics_sam['iou_damaged']      - metrics_unet['iou_damaged']),
+            ("Pixels bâtiments",  f"{bp_u:,}",                               f"{bp_s:,}",                               bp_s - bp_u),
+            ("Pixels endommagés", f"{dp_u:,}",                               f"{dp_s:,}",                               dp_s - dp_u),
+            ("Part endommagée",   f"{dr_u:.2%}",                             f"{dr_s:.2%}",                             (dr_s - dr_u) * 100),
+        ]
+
+        for label, val_u, val_s, delta in rows:
+            c1, c2, c3 = st.columns([1.2, 1, 1])
+            c1.markdown(f"**{label}**")
+            c2.markdown(val_u)
+            arrow = "🟢 +" if delta > 0.001 else ("🔴 " if delta < -0.001 else "⚪ ")
+            if isinstance(delta, float):
+                c3.markdown(f"{val_s} {arrow}{abs(delta):.4f}")
+            else:
+                c3.markdown(f"{val_s} {arrow}{abs(delta):,}")
+    else:
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("Pixels bâtiments prédits", f"{bp_u:,}")
+        metric_cols[1].metric("Pixels endommagés prédits", f"{dp_u:,}")
+        metric_cols[2].metric("Part endommagée prédite", f"{dr_u:.2%}")
+
+        metrics_unet = compute_iou_metrics(pred_unet, target)
+        m_cols = st.columns(4)
+        m_cols[0].metric("Pixel Accuracy", f"{metrics_unet['pixel_accuracy']:.4f}")
+        m_cols[1].metric("Mean IoU", f"{metrics_unet['mean_iou']:.4f}")
+        m_cols[2].metric("IoU No-Damage", f"{metrics_unet['iou_no_damage']:.4f}")
+        m_cols[3].metric("IoU Damaged", f"{metrics_unet['iou_damaged']:.4f}")
+
+def compute_iou_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    num_classes: int = 3,
+) -> dict[str, float]:
+    """Calcule pixel accuracy, mean IoU et IoU par classe."""
+    confusion = np.zeros((num_classes, num_classes), dtype=np.float64)
+    for t, p in zip(target.flatten(), pred.flatten()):
+        if 0 <= t < num_classes and 0 <= p < num_classes:
+            confusion[t, p] += 1
+
+    correct = np.trace(confusion)
+    total = confusion.sum()
+    pixel_acc = float(correct / total) if total > 0 else 0.0
+
+    intersections = np.diag(confusion)
+    unions = confusion.sum(axis=1) + confusion.sum(axis=0) - intersections
+    iou_per_class = np.divide(
+        intersections,
+        unions,
+        out=np.full(num_classes, np.nan),
+        where=unions > 0,
+    )
+    mean_iou = float(np.nanmean(iou_per_class))
+
+    return {
+        "pixel_accuracy": pixel_acc,
+        "mean_iou": mean_iou,
+        "iou_background": float(iou_per_class[0]) if not np.isnan(iou_per_class[0]) else 0.0,
+        "iou_no_damage": float(iou_per_class[1]) if not np.isnan(iou_per_class[1]) else 0.0,
+        "iou_damaged": float(iou_per_class[2]) if not np.isnan(iou_per_class[2]) else 0.0,
+    }
 
 
 def main() -> None:
@@ -248,7 +421,11 @@ def main() -> None:
     split_name = st.sidebar.selectbox("Jeu de données", ["train", "val", "test"], index=2)
     render_model_summary()
 
+    # --- Options SAM ---
+    use_sam = render_sam_sidebar()
+
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    st.sidebar.markdown("---")
     st.sidebar.write(f"Appareil: `{device_name}`")
     st.sidebar.write(f"Taille d'image: `{IMAGE_SIZE}`")
     st.sidebar.write(f"Mode cible: `{TARGET_MODE}`")
@@ -279,12 +456,31 @@ def main() -> None:
                 "Toutes les paires sont affichées."
             )
 
-    pair_id = st.selectbox("Paire d’images", pair_ids)
+    pair_id = st.selectbox("Paire d'images", pair_ids)
 
+    # --- Chargement modèle + inférence ---
     try:
         sample = load_sample(split_name, pair_id)
         model = load_model(str(CHECKPOINT_PATH), device_name)
-        prediction = predict(model, sample["image"], device_name)
+
+        if use_sam:
+            with st.spinner("Raffinement SAM en cours..."):
+                sam_refiner = load_sam_refiner(str(SAM_CHECKPOINT_PATH), device_name)
+                if sam_refiner is None:
+                    st.error("SAM n'a pas pu être chargé. Basculement en mode U-Net seul.")
+                    use_sam = False
+                    prediction = predict(model, sample["image"], device_name)
+                    pred_sam_np = None
+                else:
+                    unet_pred, sam_pred = predict_with_sam(
+                        model, sample["image"], device_name, sam_refiner
+                    )
+                    prediction = unet_pred
+                    pred_sam_np = sam_pred.numpy()
+        else:
+            prediction = predict(model, sample["image"], device_name)
+            pred_sam_np = None
+
     except (AppError, XBDDatasetError, RuntimeError, OSError, ValueError) as exc:
         st.error(str(exc))
         st.info(f"Expected checkpoint: `{CHECKPOINT_PATH}`")
@@ -292,41 +488,77 @@ def main() -> None:
 
     image_tensor = sample["image"]
     target = sample["target"].detach().cpu().numpy()
-    pred = prediction.numpy()
+    pred_unet_np = prediction.numpy()
 
     pre_image = tensor_to_rgb(image_tensor[:3])
     post_image = tensor_to_rgb(image_tensor[3:])
     target_mask = colorize_mask(target)
-    predicted_mask = colorize_mask(pred)
-    prediction_overlay = overlay_prediction(post_image, pred)
+    predicted_mask_unet = colorize_mask(pred_unet_np)
+    overlay_unet = overlay_prediction(post_image, pred_unet_np)
 
     st.subheader(f"Paire sélectionnée : `{pair_id}`")
     render_legend()
 
-    building_pixels, damaged_pixels, damaged_ratio = prediction_metrics(pred)
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("Pixels bâtiments prédits", f"{building_pixels:,}")
-    metric_cols[1].metric("Pixels endommagés prédits", f"{damaged_pixels:,}")
-    metric_cols[2].metric("Part endommagée prédite", f"{damaged_ratio:.2%}")
+    # --- Métriques ---
+    render_metrics_comparison(pred_unet_np, pred_sam_np, target)
 
+    # --- Images ---
+    st.markdown("#### Images source")
     top_cols = st.columns(2)
-    top_cols[0].image(pre_image, caption="Image avant catastrophe", width="stretch")
-    top_cols[1].image(post_image, caption="Image après catastrophe", width="stretch")
+    top_cols[0].image(pre_image, caption="Image avant catastrophe", use_container_width=True)
+    top_cols[1].image(post_image, caption="Image après catastrophe", use_container_width=True)
 
-    bottom_cols = st.columns(3)
-    bottom_cols[0].image(target_mask, caption="Vérité terrain", width="stretch")
-    bottom_cols[1].image(predicted_mask, caption="Prédiction du modèle", width="stretch")
-    bottom_cols[2].image(
-        prediction_overlay,
-        caption="Superposition sur l’image après catastrophe",
-        width="stretch",
-    )
+    st.markdown("#### Prédictions")
+
+    if use_sam and pred_sam_np is not None:
+        predicted_mask_sam = colorize_mask(pred_sam_np)
+        overlay_sam = overlay_prediction(post_image, pred_sam_np)
+
+        # Affichage côte à côte U-Net vs SAM
+        bottom_cols = st.columns(3)
+        bottom_cols[0].image(target_mask, caption="Vérité terrain", use_container_width=True)
+        bottom_cols[1].image(
+            predicted_mask_unet, caption="U-Net seul", use_container_width=True
+        )
+        bottom_cols[2].image(
+            predicted_mask_sam, caption="U-Net + SAM", use_container_width=True
+        )
+
+        st.markdown("#### Superpositions")
+        overlay_cols = st.columns(2)
+        overlay_cols[0].image(
+            overlay_unet,
+            caption="Superposition U-Net",
+            use_container_width=True,
+        )
+        overlay_cols[1].image(
+            overlay_sam,
+            caption="Superposition U-Net + SAM",
+            use_container_width=True,
+        )
+    else:
+        bottom_cols = st.columns(3)
+        bottom_cols[0].image(target_mask, caption="Vérité terrain", use_container_width=True)
+        bottom_cols[1].image(
+            predicted_mask_unet,
+            caption="Prédiction du modèle",
+            use_container_width=True,
+        )
+        bottom_cols[2].image(
+            overlay_unet,
+            caption="Superposition sur l'image après catastrophe",
+            use_container_width=True,
+        )
 
     with st.expander("Détails de l'échantillon"):
         st.write(f"Lignes du jeu sélectionné: `{len(split_df):,}`")
         st.write(f"Forme du tenseur d'entrée: `{tuple(image_tensor.shape)}`")
         st.write(f"Classes de vérité terrain: `{np.unique(target).tolist()}`")
-        st.write(f"Classes prédites: `{np.unique(pred).tolist()}`")
+        st.write(f"Classes prédites (U-Net): `{np.unique(pred_unet_np).tolist()}`")
+        if pred_sam_np is not None:
+            st.write(f"Classes prédites (SAM): `{np.unique(pred_sam_np).tolist()}`")
+        st.write(f"SAM activé: `{use_sam}`")
+        st.write(f"Checkpoint SAM: `{SAM_CHECKPOINT_PATH}`")
 
 
 if __name__ == "__main__":
