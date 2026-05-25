@@ -97,11 +97,8 @@ class SAMRefiner:
         refined = pred_np.copy()
         sam_union = sam_masks.any(axis=0)
 
-        # Faux positifs U-Net → background
+        # Faux positifs U-Net -> background
         refined[building_mask & ~sam_union] = 0
 
-        # Bâtiments SAM manqués par U-Net → no-damage
-        # refined[sam_union & ~building_mask] = 1  # désactivé
-
-        # Pixels dans les deux → classe U-Net préservée
+        # Pixels dans les deux -> classe U-Net préservée
         return torch.from_numpy(refined)
