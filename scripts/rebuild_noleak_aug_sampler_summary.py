@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--augment-prob", default="0.5")
     parser.add_argument("--damage-augment-threshold", default="0.001")
     parser.add_argument("--high-damage-threshold", default="0.06")
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        default=None,
+        help="Optional variants as augment|sampler|alpha tokens.",
+    )
     return parser.parse_args()
 
 
@@ -210,9 +216,10 @@ def rebuild_summary(args: argparse.Namespace) -> None:
         for path in predictions_dir.glob("unet_*_aug_noleak_*_test_metrics.json")
     }
     splits = args.splits if args.splits is not None else DEFAULT_SPLITS
+    variants = parse_variants(args.variants) if args.variants is not None else DEFAULT_VARIANTS
     rows = []
     for split in splits:
-        for augment_mode, sampler, alpha in DEFAULT_VARIANTS:
+        for augment_mode, sampler, alpha in variants:
             row = build_row(args, split, augment_mode, sampler, alpha, available_metrics)
             if row is not None:
                 rows.append(row)
@@ -227,6 +234,19 @@ def rebuild_summary(args: argparse.Namespace) -> None:
 
     print(f"Saved summary CSV: {output_path}")
     print(f"Rows: {len(rows)}")
+
+
+def parse_variants(tokens: list[str]) -> list[tuple[str, str, str]]:
+    variants = []
+    for token in tokens:
+        parts = token.split("|")
+        if len(parts) != 3:
+            raise SummaryError(
+                "Invalid --variants token. Expected augment|sampler|alpha, "
+                f"got: {token}"
+            )
+        variants.append((parts[0], parts[1], parts[2]))
+    return variants
 
 
 def main() -> int:

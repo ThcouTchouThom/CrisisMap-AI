@@ -45,6 +45,9 @@ COMBOS=(
   "safe|damage-sqrt|4"
   "damage-aware|damage-sqrt|4"
 )
+if [ -n "${AUG_SAMPLER_COMBOS:-}" ]; then
+  read -r -a COMBOS <<< "$AUG_SAMPLER_COMBOS"
+fi
 
 split_has_files() {
   local split_dir="$1"
@@ -135,7 +138,8 @@ rebuild_summary() {
     --epochs "$EPOCHS" \
     --augment-prob "$AUGMENT_PROB" \
     --damage-augment-threshold "$DAMAGE_AUGMENT_THRESHOLD" \
-    --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD"
+    --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD" \
+    --variants "${COMBOS[@]}"
 
   python scripts/rebuild_noleak_aug_sampler_summary.py \
     --output "$PART_SUMMARY_CSV" \
@@ -243,6 +247,7 @@ echo "HIGH_DAMAGE_THRESHOLD=${HIGH_DAMAGE_THRESHOLD}"
 echo "FORCE=${FORCE} FORCE_INCOMPLETE=${FORCE_INCOMPLETE}"
 echo "Global summary: ${SUMMARY_CSV}"
 echo "Part summary: ${PART_SUMMARY_CSV}"
+echo "Variants: ${COMBOS[*]}"
 
 for combo in "${COMBOS[@]}"; do
   IFS="|" read -r augment_mode sampler alpha <<< "$combo"
