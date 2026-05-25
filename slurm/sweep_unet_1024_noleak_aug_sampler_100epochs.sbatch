@@ -14,6 +14,8 @@
 # Email notifications to avoid frequent scheduler polling
 
 # No-leak augmentation/sampler sweep for 1024 U-Net.
+# Not recommended as a single submission; use split-specific part scripts instead.
+# The original 8-variant match_hist1000 job timed out after 7/8 variants.
 # Force reruns: sbatch --export=ALL,FORCE=1 slurm/sweep_unet_1024_noleak_aug_sampler_100epochs.sbatch
 
 set -euo pipefail

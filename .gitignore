@@ -57,6 +57,10 @@ Thumbs.db
 # Course documents
 *.pdf
 
+# Local milestone ZIP staging folders
+RENDU_JALON_2_Aftermath/
+RENDU_JALON_2_Aftermath.zip
+
 # Model weights and exported models
 *.pt
 *.pth
