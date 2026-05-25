@@ -53,6 +53,15 @@ If you received a trained checkpoint, place it at:
 outputs/checkpoints/unet_baseline_512_v2_30epochs/best_unet.pt
 ```
 
+To have the SAM2 checkpoint for mask refinement:
+
+```powershell
+New-Item -ItemType Directory -Force -Path "src\models\sam"
+Invoke-WebRequest -Uri "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt" -OutFile "models\sam\sam_vit_b_01ec64.pth"
+```
+
+SAM2 is optional. The Streamlit app works without it but the "Activer SAM" toggle in the sidebar will be disabled.
+
 Run the Streamlit prototype:
 
 ```powershell
@@ -68,6 +77,7 @@ Each sample combines:
 - target damage mask
 
 The model input is a 6-channel tensor formed by concatenating pre-disaster RGB and post-disaster RGB images. The baseline model is a lightweight U-Net with `7,763,971` trainable parameters.
+A SAM2 (Segment Anything Model 2) post-processing step is optionally applied after U-Net inference to refine building contours using the post-disaster image as visual reference.
 
 ## Current Pipeline
 
@@ -186,6 +196,7 @@ CrisisMap AI/
     data/                      # Inspection, indexing, splitting, and dataset code.
     evaluation/                # Evaluation and prediction scripts.
     models/                    # U-Net model definition.
+      sam/                       # SAM2 checkpoint; not committed (download separately).
     training/                  # U-Net training script.
     visualization/             # Dataset and metrics visualization scripts.
 ```
