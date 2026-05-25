@@ -1,5 +1,3 @@
-"""Post-processing refinement using SAM2."""
-
 from __future__ import annotations
 
 import numpy as np
