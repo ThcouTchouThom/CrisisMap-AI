@@ -7,31 +7,30 @@ Ce document sert de guide rapide pour rejoindre le projet sans lire tout le code
 1. Aftermath est un prototype de cartographie automatique des dommages après catastrophe.
 2. Le projet utilise le dataset xBD/xView2.
 3. Chaque exemple contient une image satellite avant et une image après catastrophe.
-4. Le modèle reçoit les deux images RGB concaténées en 6 canaux.
-5. La sortie actuelle est un masque à 3 classes : background, no damage, damaged.
+4. Le modèle damage reçoit les deux images RGB concaténées en 6 canaux.
+5. La sortie damage actuelle est un masque à 3 classes : fond, bâtiment non endommagé, bâtiment endommagé.
 6. Le baseline principal est un U-Net de segmentation sémantique.
-7. Les données brutes, checkpoints et sorties générées ne sont pas suivis dans Git.
-8. Le dépôt contient des scripts pour inspecter, indexer, splitter, entraîner et évaluer.
+7. Le protocole courant utilise une validation et un test communs no-leak.
+8. Une branche building-only évalue la segmentation binaire fond/bâtiment.
 9. Les entraînements lourds se font sur Rorqual H100 avec SLURM.
-10. Le prototype Streamlit permet de visualiser les images, masques et prédictions.
+10. Le prototype Streamlit alpha accepte aussi une paire réelle téléversée pour inférence.
 
 ## 2. Structure du dépôt
 
 ```text
 app/                         # Prototype Streamlit.
-configs/                     # Configurations éventuelles.
+configs/                     # Notes et configurations éventuelles.
 data/                        # Données locales; les fichiers lourds sont ignorés.
-deliverables/                # Livrables de cours.
+deliverables/                # Sources légères de livrables de cours.
 docs/                        # Documentation pour l'équipe.
-notebooks/                   # Exploration.
 outputs/                     # Checkpoints, figures, métriques; ignorés.
-scripts/                     # Scripts utilitaires locaux.
+scripts/                     # Scripts utilitaires, splits, évaluations, building-only.
 slurm/                       # Scripts Alliance / Rorqual.
 src/crisismap/
   data/                      # Dataset, inspection, indexation, splits.
   evaluation/                # Évaluation et visualisation de prédictions.
   models/                    # U-Net.
-  training/                  # Entraînement.
+  training/                  # Entraînement damage.
   visualization/             # Figures dataset et métriques.
 ```
 
@@ -107,7 +106,16 @@ Depuis la racine du dépôt :
 streamlit run app/streamlit_app.py
 ```
 
-Le checkpoint attendu doit être dans `outputs/checkpoints/...`. Les checkpoints ne sont pas dans Git.
+Le prototype alpha possède deux modes :
+
+- mode dataset xBD : sélection d'un split et d'une paire connue, avec vérité terrain et métriques locales ;
+- mode téléversement : ajout d'une paire réelle pré/post, inférence uniquement, sans métriques faute de vérité terrain.
+
+Le checkpoint attendu n'est pas dans Git. Pour la démo damage actuelle, il doit être restauré ici :
+
+```text
+outputs/checkpoints/unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs/best_unet_portable.pt
+```
 
 ## 7. Petit test local
 
@@ -148,19 +156,22 @@ python src/crisismap/training/train_unet.py `
 
 Données :
 
-- `inspect_xbd.py` : vérifie la structure images/labels/targets.
-- `build_xbd_index.py` : crée `data/processed/xbd_train_index.csv`.
-- `summarize_xbd_index.py` : résume classes, catastrophes et ratios.
-- `create_xbd_splits.py` : crée des splits simples.
-- `create_advanced_noleak_train_splits.py` : crée des splits avancés sans fuite.
+- `src/crisismap/data/inspect_xbd.py` : vérifie la structure images/labels/targets.
+- `src/crisismap/data/build_xbd_index.py` : crée `data/processed/xbd_train_index.csv`.
+- `src/crisismap/data/summarize_xbd_index.py` : résume classes, catastrophes et ratios.
+- `src/crisismap/data/create_xbd_splits.py` : crée des splits simples.
+- `scripts/create_noleak_common_eval_splits.py` : crée des splits avec validation/test communs.
+- `scripts/create_advanced_noleak_train_splits.py` : crée des splits avancés sans fuite.
 
-Modèle et entraînement :
+Modèles et évaluation :
 
-- `xbd_dataset.py` : charge pré/post/mask et crée un tenseur 6 canaux.
-- `unet.py` : définit le U-Net.
-- `train_unet.py` : entraîne le modèle, avec pertes, augmentation et sampler.
-- `evaluate_unet.py` : calcule accuracy, IoU, précision, rappel, F1.
-- `predict_unet_sample.py` : visualise une prédiction.
+- `src/crisismap/data/xbd_dataset.py` : charge pré/post/mask et crée le tenseur 6 canaux.
+- `src/crisismap/models/unet.py` : définit le U-Net damage.
+- `src/crisismap/training/train_unet.py` : entraîne le modèle damage avec pertes, augmentation et sampler.
+- `src/crisismap/evaluation/evaluate_unet.py` : calcule accuracy, IoU, précision, rappel, F1.
+- `scripts/evaluate_oracle_building_mask_gain.py` : mesure le gain théorique d'un masque bâtiment parfait.
+- `scripts/train_building_segmentation.py` : entraîne la segmentation binaire fond/bâtiment.
+- `scripts/evaluate_building_segmentation.py` : évalue un checkpoint building-only.
 
 Interface :
 
@@ -169,7 +180,7 @@ Interface :
 Cluster :
 
 - `slurm/setup_rorqual.sh` : préparation côté Rorqual.
-- `slurm/*.sbatch` : jobs d'entraînement et sweeps.
+- `slurm/*.sbatch` : jobs d'entraînement, sweeps et évaluations.
 
 ## 9. Erreurs fréquentes à éviter
 
@@ -183,9 +194,11 @@ Confondre chemins Windows et Linux :
 - Windows local : `data/raw/xbd/train` ou `.\data\raw\xbd\train` ;
 - Rorqual : chemins Linux sous `~/work` et `~/scratch`.
 
-Oublier de committer un helper script :
+Oublier que les checkpoints ne sont pas dans Git :
 
-- si un `.sbatch` appelle un script local non committé, Rorqual ne le verra pas après `git pull`.
+- le dépôt contient le code et les scripts ;
+- les fichiers `.pt`, `.pth`, outputs lourds et archives de données restent hors Git ;
+- si Streamlit échoue au chargement du modèle, vérifier d'abord le chemin du checkpoint.
 
 Créer du data leakage :
 
@@ -195,9 +208,9 @@ Créer du data leakage :
 
 Poller trop souvent Rorqual :
 
-- éviter `watch squeue` ;
-- préférer les notifications courriel SLURM ;
-- commandes ponctuelles raisonnables : `squeue -u $USER`, `tail -f <log>`.
+- ne pas utiliser de boucle `watch squeue` ;
+- les scripts SLURM incluent des notifications courriel ;
+- commandes ponctuelles raisonnables : `squeue -u $USER`, puis consultation des logs.
 
 Commettre des fichiers lourds :
 
@@ -291,7 +304,7 @@ sbatch slurm/smoke_unet_512.sbatch
 sbatch slurm/sweep_unet_1024_noleak_aug_sampler_100epochs_match_hist1000.sbatch
 ```
 
-Vérifier un job sans poller agressivement :
+Vérifier un job sans polling agressif :
 
 ```bash
 squeue -u $USER
@@ -305,4 +318,3 @@ scancel <jobid>
 ```
 
 Récupérer les résultats depuis Windows se fait avec `scp`, en copiant surtout les métriques JSON/CSV, figures utiles et checkpoints choisis.
-

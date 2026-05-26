@@ -2,31 +2,31 @@
 
 **Voir les dégâts pour agir plus vite.**
 
-Aftermath, aussi appelé CrisisMap AI dans le code, est un prototype académique de segmentation des dommages aux bâtiments après catastrophe. Le projet utilise des paires d'images satellites avant/après du dataset xBD/xView2 afin de produire des cartes de dommages au niveau pixel.
+Aftermath, aussi appelé CrisisMap AI dans le code, est un projet académique de segmentation des dommages aux bâtiments après catastrophe. Il utilise des paires d'images satellites avant/après issues du dataset xBD/xView2 afin de produire une carte visuelle des bâtiments intacts et endommagés.
 
-Équipe : Thomas Gourjault, Aurélien Casagrandi, Grégory Jourdain.
+Équipe : Thomas GOURJAULT, Grégory JOURDAIN, Aurélien CASAGRANDI, Matthis LAHARGOUE.
 
 ## Objectif
 
-Le but est de construire une chaîne complète :
+Le projet construit une chaîne complète :
 
 ```text
-archives xBD/xView2 -> extraction -> index CSV -> splits -> Dataset PyTorch -> U-Net -> métriques -> prototype
+archives xBD/xView2 -> extraction -> index CSV -> splits -> Dataset PyTorch -> modèle -> métriques -> prototype Streamlit
 ```
 
-Le prototype actuel répond à une formulation de segmentation sémantique à 3 classes :
+La formulation IA actuelle est une segmentation sémantique à 3 classes :
 
 | Classe | Signification |
 | --- | --- |
-| `0` | background / absence de bâtiment |
+| `0` | fond / absence de bâtiment |
 | `1` | bâtiment non endommagé |
 | `2` | bâtiment endommagé |
 
-L'entrée du modèle est un tenseur à 6 canaux : image RGB pré-catastrophe + image RGB post-catastrophe. La segmentation multi-niveaux des dommages, plus proche du format original xBD, est un objectif futur.
+L'entrée du modèle damage est un tenseur à 6 canaux : image RGB pré-catastrophe + image RGB post-catastrophe. La segmentation multi-niveaux des dommages, plus proche du format original xBD, reste un objectif futur.
 
 ## Dataset
 
-Le projet utilise le jeu d'entraînement xBD/xView2. Les données brutes, images extraites, checkpoints et sorties générées ne sont pas versionnés dans Git.
+Le projet utilise le jeu d'entraînement xBD/xView2. Les données brutes, les images extraites, les checkpoints et les sorties générées ne sont pas versionnés dans Git.
 
 Archives attendues localement :
 
@@ -44,24 +44,24 @@ data/raw/xbd/train/targets/
 data/raw/geotransforms/xview_geotransforms.json
 ```
 
-`xview_geotransforms.json` contient des métadonnées de géoréférencement utiles pour replacer plus tard les prédictions sur une carte ou dans un outil GIS. Il est extrait, mais pas encore utilisé dans l'entraînement.
+`xview_geotransforms.json` contient des métadonnées de géoréférencement utiles pour replacer plus tard les prédictions dans une carte ou un outil GIS. Ces données sont extraites, mais elles ne sont pas encore intégrées à l'entraînement.
 
 ## Structure du dépôt
 
 ```text
 app/                         # Prototype Streamlit.
-configs/                     # Configuration éventuelle des expériences.
-data/                        # Données locales et CSV traités; les données lourdes ne sont pas suivies.
-deliverables/                # Livrables de cours, dont le jalon 2.
-notebooks/                   # Exploration.
+configs/                     # Notes et configurations éventuelles.
+data/                        # Données locales et CSV traités; les fichiers lourds sont ignorés.
+deliverables/                # Sources légères de livrables de cours.
+docs/                        # Documentation projet et onboarding.
 outputs/                     # Checkpoints, figures, métriques; non suivis.
-scripts/                     # Scripts utilitaires locaux et génération de splits.
+scripts/                     # Scripts utilitaires, splits avancés, évaluations complémentaires.
 slurm/                       # Scripts Alliance / Rorqual.
 src/crisismap/
   data/                      # Inspection, indexation, splits, Dataset PyTorch.
   evaluation/                # Évaluation et visualisation de prédictions.
   models/                    # U-Net.
-  training/                  # Entraînement.
+  training/                  # Entraînement damage.
   visualization/             # Figures dataset et métriques.
 ```
 
@@ -72,34 +72,70 @@ Les scripts principaux sont :
 - `src/crisismap/data/inspect_xbd.py` : inspection de la structure xBD.
 - `src/crisismap/data/build_xbd_index.py` : construction de `data/processed/xbd_train_index.csv`.
 - `src/crisismap/data/summarize_xbd_index.py` : statistiques exploratoires.
-- `src/crisismap/data/create_xbd_splits.py` : splits simples train/validation/test.
-- `scripts/create_advanced_noleak_train_splits.py` : splits avancés sans fuite de données.
-- `src/crisismap/data/xbd_dataset.py` : Dataset PyTorch 6 canaux.
+- `src/crisismap/data/create_xbd_splits.py` : création de splits simples.
+- `scripts/create_noleak_common_eval_splits.py` : création de splits sans fuite autour d'une validation et d'un test communs.
+- `scripts/create_advanced_noleak_train_splits.py` : génération de splits no-leak avancés.
+- `src/crisismap/data/xbd_dataset.py` : Dataset PyTorch pour les paires pré/post.
 
-Le dataset brut contient 2799 paires pré/post. Certains splits filtrent les images avec trop peu d'information bâtiment, notamment avec `min_nonzero_ratio >= 0.01`.
+Le dataset brut contient 2 799 paires pré/post. Certains splits filtrent les images avec trop peu d'information bâtiment, notamment via `min_nonzero_ratio >= 0.01`.
 
-## Méthodologie actuelle
+## Méthodologie no-leak
 
-Les premières comparaisons ont révélé un risque de data leakage entre certains splits d'entraînement et un test global. Le protocole actuel utilise donc une validation et un test communs :
+Des comparaisons intermédiaires ont révélé un risque de fuite de données entre certains splits d'entraînement et un test global. Le protocole actuel fixe donc une validation et un test communs :
 
 ```text
 common_val  = data/processed/splits_full/val_pairs.csv
 common_test = data/processed/splits_full/test_pairs.csv
 ```
 
-Les nouveaux splits d'entraînement excluent tous les `pair_id` présents dans ces deux fichiers. La validation et le test ne sont pas augmentés et ne sont pas pondérés par sampler.
+Les nouveaux splits d'entraînement excluent tous les `pair_id` présents dans ces deux fichiers. La validation et le test ne sont jamais augmentés et n'utilisent pas de sampler pondéré.
 
-## Baseline IA
+## Baseline damage
 
-Le baseline est un U-Net léger :
+Le baseline principal est un U-Net :
 
 - entrée : 6 canaux, pré RGB + post RGB ;
 - sortie : 3 classes ;
 - perte de référence : Cross-Entropy pondérée + Dice loss ;
 - poids de référence : `[0.05, 1.0, 4.0]` ;
-- expériences réalisées en 512 et 1024 pixels.
+- expériences en 512 et 1024 pixels.
 
-Le baseline local 512 a validé toute la chaîne. Les expériences 1024 no-leak sur Rorqual servent à améliorer la classe `damaged`, qui reste la plus difficile et la plus importante.
+La référence no-leak actuelle donne environ `IoU damaged = 0.4175` et `F1 damaged = 0.5891`. La classe endommagée reste la plus difficile, car elle est rare et moins régulière que le fond ou les bâtiments intacts.
+
+## Oracle et branche bâtiment
+
+Une expérience oracle a mesuré le gain théorique d'une segmentation bâtiment parfaite :
+
+- prédiction brute : `IoU damaged ≈ 0.4175`, `F1 damaged ≈ 0.5891` ;
+- oracle building clip : `IoU damaged ≈ 0.4782`, `F1 damaged ≈ 0.6470` ;
+- oracle component majority : `IoU damaged ≈ 0.5383`, `F1 damaged ≈ 0.6999`.
+
+Ce résultat motive une future architecture en deux étapes : segmenter les bâtiments, puis classifier les dommages par pixel ou par composante bâtiment.
+
+Une branche building-only a été ajoutée pour la tâche binaire `fond / bâtiment`, avec `target = original_target > 0`. Le premier modèle testé est un U-Net++ EfficientNet-B3 en entrée pré-catastrophe, avec focal Tversky. Les métriques préliminaires de validation sont environ `building IoU = 0.6536`, `recall = 0.8120`, `F1 = 0.7905`.
+
+## Prototype Streamlit
+
+Le prototype alpha Streamlit permet :
+
+- de sélectionner une paire du dataset xBD ;
+- de téléverser une paire réelle pré/post ;
+- de lancer l'inférence ;
+- d'afficher en priorité la superposition de la prédiction sur l'image post-catastrophe ;
+- d'afficher les détails : image avant, image après, masque prédit ;
+- d'afficher des métriques seulement en mode dataset, quand la vérité terrain existe.
+
+Commande :
+
+```powershell
+streamlit run app/streamlit_app.py
+```
+
+Le checkpoint de démonstration attendu n'est pas dans Git :
+
+```text
+outputs/checkpoints/unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs/best_unet_portable.pt
+```
 
 ## Installation locale
 
@@ -112,13 +148,13 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Pour une installation complète à partir des archives locales, utiliser le script PowerShell :
+Installation complète à partir des archives locales :
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/setup_project.ps1
 ```
 
-Pour reconstruire les fichiers traités :
+Reconstruction forcée des fichiers traités :
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/setup_project.ps1 -Force
@@ -132,19 +168,13 @@ Inspection :
 python src/crisismap/data/inspect_xbd.py --root data/raw/xbd/train
 ```
 
-Visualisation d'un échantillon :
-
-```powershell
-python src/crisismap/visualization/visualize_xbd_sample.py --root data/raw/xbd/train --mode 3-class
-```
-
 Indexation :
 
 ```powershell
 python src/crisismap/data/build_xbd_index.py --root data/raw/xbd/train --output data/processed/xbd_train_index.csv
 ```
 
-Entraînement baseline :
+Entraînement damage :
 
 ```powershell
 python src/crisismap/training/train_unet.py `
@@ -172,70 +202,82 @@ python src/crisismap/evaluation/evaluate_unet.py `
   --target-mode 3-class
 ```
 
-Visualisation d'une prédiction :
+Oracle building mask :
 
 ```powershell
-python src/crisismap/evaluation/predict_unet_sample.py `
+python scripts/evaluate_oracle_building_mask_gain.py `
   --root data/raw/xbd/train `
-  --split-csv data/processed/splits/test_pairs.csv `
-  --checkpoint outputs/checkpoints/unet_baseline/best_unet.pt `
-  --image-size 512 `
-  --target-mode 3-class
+  --split-csv data/processed/splits_full/test_pairs.csv `
+  --checkpoint outputs/checkpoints/unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs/best_unet.pt `
+  --output-json outputs/predictions/oracle_building_mask_metrics.json
 ```
 
-## Prototype Streamlit
-
-L'application Streamlit permet de sélectionner un split et une paire d'images, puis d'afficher l'image avant, l'image après, le masque vérité terrain, la prédiction et une superposition sur l'image post-catastrophe.
+Segmentation bâtiment :
 
 ```powershell
-streamlit run app/streamlit_app.py
+python scripts/train_building_segmentation.py `
+  --root data/raw/xbd/train `
+  --train-csv data/processed/splits_noleak_full_train/train_pairs.csv `
+  --val-csv data/processed/splits_noleak_full_train/val_pairs.csv `
+  --output-dir outputs/checkpoints/building_pre_unetplusplus_effb3 `
+  --model unetplusplus_effb3 `
+  --input-mode pre `
+  --target-mode building-binary
 ```
-
-Le checkpoint utilisé par défaut doit être placé dans `outputs/checkpoints/`. Les checkpoints ne sont pas inclus dans Git.
 
 ## Rorqual / SLURM
 
-Les entraînements lourds sont préparés pour Alliance / Calcul Québec, notamment Rorqual H100. Les fichiers utiles sont dans `slurm/` :
+Les entraînements lourds sont préparés pour Alliance / Calcul Québec, notamment Rorqual H100. Les fichiers utiles sont dans `slurm/`.
 
-- `slurm/setup_rorqual.sh` : installation côté cluster et préparation des données.
-- `slurm/smoke_unet_512.sbatch` : test technique court.
-- `slurm/train_unet_full_1024.sbatch` : entraînement 1024 complet.
-- `slurm/sweep_*.sbatch` : campagnes de splits, augmentation et samplers.
+Repères :
 
-Les scripts utilisent les répertoires `~/work/CrisisMap-AI` pour le code et `~/scratch/CrisisMap-AI` pour les données, sorties et logs. Ils incluent des notifications courriel pour éviter un polling fréquent du scheduler.
+- code : `~/work/CrisisMap-AI` ;
+- données et sorties : `~/scratch/CrisisMap-AI` ;
+- venv : `~/virtualenvs/crisismap-ai` ;
+- modules : `StdEnv/2023`, `python/3.11`, `gcc`, `arrow/23.0.1`, `cuda`, `opencv/4.13.0`.
+
+Les scripts SLURM incluent des notifications courriel afin d'éviter le polling fréquent du scheduler. Il faut préférer des vérifications ponctuelles avec `squeue -u $USER` et la lecture des logs.
 
 ## Livrables
 
-Le dossier du jalon 2 est ici :
+Le dossier local de rendu Jalon 3 est ignoré par Git :
 
 ```text
-deliverables/jalon_2/README_jalon_2.md
+RENDU_JALON_3_Aftermath/
+RENDU_JALON_3_Aftermath.zip
 ```
 
-Il contient une synthèse en français, des sources NotebookLM, un plan de présentation, des résultats résumés et quelques petites figures.
+Il contient un rapport unique, des scripts représentatifs, des exemples légers et des notes expliquant les checkpoints exclus pour respecter les limites d'upload.
 
-## État actuel
+Des sources Markdown légères pour NotebookLM sont aussi disponibles dans :
+
+```text
+deliverables/jalon_3/notebooklm_sources/
+```
+
+## État actuel et prochaines étapes
 
 Terminé :
 
-- pipeline de données xBD/xView2 ;
-- visualisations ;
+- pipeline xBD/xView2 ;
+- visualisations et index CSV ;
 - Dataset PyTorch ;
 - U-Net baseline ;
-- métriques d'évaluation ;
 - protocole no-leak ;
-- scripts SLURM ;
-- prototype Streamlit.
+- expérience oracle bâtiment ;
+- première branche building-only ;
+- prototype Streamlit alpha avec mode upload.
 
 En cours :
 
-- campagne augmentation/sampler train-only ;
-- comparaison des meilleurs splits no-leak ;
-- mise à jour du prototype avec le meilleur checkpoint final.
+- consolidation de la campagne Rorqual augmentation/sampler ;
+- sélection du meilleur modèle damage ;
+- évaluation test de la segmentation bâtiment.
 
 Étapes futures :
 
-- analyse qualitative des erreurs ;
-- segmentation multi-niveaux des dommages ;
-- exploitation des geotransforms pour une visualisation cartographique ;
-- architectures plus fortes : Siamese U-Net, SegFormer, ChangeFormer, modèles hybrides segmentation/classification.
+- intégrer un masque bâtiment prédit dans le post-processing damage ;
+- améliorer les contours et réduire les faux positifs ;
+- revenir à une segmentation multi-niveaux des dommages ;
+- exploiter les geotransforms pour une carte géoréférencée ;
+- tester des architectures plus fortes : Siamese U-Net, SegFormer, ChangeFormer, modèles hybrides segmentation/classification.
