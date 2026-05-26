@@ -210,9 +210,9 @@ def predict_with_sam(
     unet_pred = torch.argmax(logits, dim=1).squeeze(0).cpu()
 
     # Image post seule (canaux 3-5) pour SAM
-    post_image = image[3:].unsqueeze(0)  # (1, 3, H, W)
+    pre_image = image[:3].unsqueeze(0)  # (1, 3, H, W)
     sam_pred = sam_refiner.refine_batch(
-        post_images=post_image,
+        pre_images=pre_image,
         unet_preds=unet_pred.unsqueeze(0),
     ).squeeze(0)
 
