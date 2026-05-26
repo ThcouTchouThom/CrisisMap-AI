@@ -12,6 +12,8 @@ matplotlib
 # Deep learning baseline
 torch
 torchvision
+segmentation-models-pytorch==0.5.0
+timm==1.0.27
 
 # Configuration and notebooks
 pyyaml

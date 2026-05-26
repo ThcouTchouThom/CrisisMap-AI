@@ -13,7 +13,7 @@ from PIL import Image
 
 
 REQUIRED_COLUMNS = {"pair_id", "pre_image", "post_image", "target"}
-TARGET_MODES = {"3-class", "5-class"}
+TARGET_MODES = {"3-class", "5-class", "building-binary"}
 AUGMENT_MODES = {"none", "safe", "damage-aware"}
 DAMAGE_CLASSES = {2, 3, 4}
 
@@ -256,6 +256,9 @@ def reduce_mask_channels(mask: np.ndarray) -> np.ndarray:
 def convert_target_mode(mask: np.ndarray, target_mode: str) -> np.ndarray:
     mask = np.asarray(mask)
     validate_known_target_values(mask)
+
+    if target_mode == "building-binary":
+        return (mask > 0).astype(np.int64, copy=False)
 
     if target_mode == "5-class":
         return mask.astype(np.int64, copy=False)
