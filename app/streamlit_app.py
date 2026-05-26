@@ -306,40 +306,50 @@ def render_prediction_outputs(
     st.subheader(title)
     render_legend()
 
-    if target is not None:
-        building_pixels, damaged_pixels, damaged_ratio = prediction_counts(prediction)
-        metrics = sample_metrics(prediction, target)
-        metric_cols = st.columns(6)
-        metric_cols[0].metric("Pixels bâtiments prédits", f"{building_pixels:,}")
-        metric_cols[1].metric("Pixels endommagés prédits", f"{damaged_pixels:,}")
-        metric_cols[2].metric("Part endommagée prédite", f"{damaged_ratio:.2%}")
-        metric_cols[3].metric("Pixel accuracy", f"{metrics['pixel_accuracy']:.3f}")
-        metric_cols[4].metric("Mean IoU", f"{metrics['mean_iou']:.3f}")
-        metric_cols[5].metric("IoU damaged", f"{metrics['iou_damaged']:.3f}")
-    else:
-        st.info("No ground truth provided — inference only.")
-
-    top_cols = st.columns(2)
-    top_cols[0].image(pre_image, caption="Image avant catastrophe", width="stretch")
-    top_cols[1].image(post_image, caption="Image après catastrophe", width="stretch")
+    st.markdown("## Résultat principal")
+    st.image(
+        prediction_overlay,
+        caption="Superposition de la prédiction sur l'image après catastrophe",
+        width="stretch",
+    )
 
     if target is None:
-        bottom_cols = st.columns(2)
-        bottom_cols[0].image(predicted_mask, caption="Prédiction du modèle", width="stretch")
-        bottom_cols[1].image(
-            prediction_overlay,
-            caption="Superposition sur l'image après catastrophe",
-            width="stretch",
-        )
-    else:
-        bottom_cols = st.columns(3)
-        bottom_cols[0].image(colorize_mask(target), caption="Vérité terrain", width="stretch")
-        bottom_cols[1].image(predicted_mask, caption="Prédiction du modèle", width="stretch")
-        bottom_cols[2].image(
-            prediction_overlay,
-            caption="Superposition sur l'image après catastrophe",
-            width="stretch",
-        )
+        st.info("Aucune vérité terrain fournie — inférence uniquement.")
+
+    st.markdown("## Détails de l'inférence")
+    detail_cols = st.columns(3)
+    detail_cols[0].image(pre_image, caption="Image avant catastrophe", width="stretch")
+    detail_cols[1].image(post_image, caption="Image après catastrophe", width="stretch")
+    detail_cols[2].image(predicted_mask, caption="Prédiction du modèle", width="stretch")
+
+    if target is not None:
+        with st.expander("Vérité terrain et métriques de la paire", expanded=True):
+            comparison_cols = st.columns(3)
+            comparison_cols[0].image(
+                colorize_mask(target),
+                caption="Vérité terrain",
+                width="stretch",
+            )
+            comparison_cols[1].image(
+                predicted_mask,
+                caption="Prédiction du modèle",
+                width="stretch",
+            )
+            comparison_cols[2].image(
+                prediction_overlay,
+                caption="Superposition",
+                width="stretch",
+            )
+
+            building_pixels, damaged_pixels, damaged_ratio = prediction_counts(prediction)
+            metrics = sample_metrics(prediction, target)
+            metric_cols = st.columns(6)
+            metric_cols[0].metric("Pixels bâtiments prédits", f"{building_pixels:,}")
+            metric_cols[1].metric("Pixels endommagés prédits", f"{damaged_pixels:,}")
+            metric_cols[2].metric("Part endommagée prédite", f"{damaged_ratio:.2%}")
+            metric_cols[3].metric("Pixel accuracy", f"{metrics['pixel_accuracy']:.3f}")
+            metric_cols[4].metric("Mean IoU", f"{metrics['mean_iou']:.3f}")
+            metric_cols[5].metric("IoU damaged", f"{metrics['iou_damaged']:.3f}")
 
 
 def render_dataset_mode(device_name: str) -> None:
@@ -419,7 +429,7 @@ def render_dataset_mode(device_name: str) -> None:
 
 
 def render_upload_mode(device_name: str) -> None:
-    st.subheader("Upload real image pair")
+    st.subheader("Téléverser une paire réelle")
     st.write(
         "Téléversez une image avant catastrophe et une image après catastrophe. "
         "Les deux images seront redimensionnées au format du modèle pour l'inférence."
@@ -427,17 +437,17 @@ def render_upload_mode(device_name: str) -> None:
 
     upload_cols = st.columns(2)
     pre_file = upload_cols[0].file_uploader(
-        "Pre-disaster image",
+        "Image avant catastrophe",
         type=["png", "jpg", "jpeg", "tif", "tiff"],
         key="upload_pre",
     )
     post_file = upload_cols[1].file_uploader(
-        "Post-disaster image",
+        "Image après catastrophe",
         type=["png", "jpg", "jpeg", "tif", "tiff"],
         key="upload_post",
     )
 
-    run_clicked = st.button("Run inference", type="primary")
+    run_clicked = st.button("Lancer l'inférence", type="primary")
     if not run_clicked:
         st.info("Ajoutez les deux images, puis lancez l'inférence.")
         return
@@ -477,8 +487,8 @@ def main() -> None:
 
     mode = st.sidebar.radio(
         "Mode",
-        ["Dataset xBD", "Upload real image pair"],
-        help="Le mode upload ne nécessite pas de vérité terrain.",
+        ["Dataset xBD", "Téléverser une paire réelle"],
+        help="Le mode téléversement ne nécessite pas de vérité terrain.",
     )
 
     if mode == "Dataset xBD":
