@@ -25,20 +25,20 @@ class SAMRefiner:
 
     def refine_batch(
         self,
-        post_images: torch.Tensor,
+        pre_images: torch.Tensor,
         unet_preds: torch.Tensor,
     ) -> torch.Tensor:
         refined = []
-        for img, pred in zip(post_images, unet_preds):
+        for img, pred in zip(pre_images, unet_preds):
             refined.append(self._refine_single(img, pred))
         return torch.stack(refined)
 
     def _refine_single(
         self,
-        post_image: torch.Tensor,
+        pre_image: torch.Tensor,
         unet_pred: torch.Tensor,
     ) -> torch.Tensor:
-        img_np = self._to_rgb_numpy(post_image)
+        img_np = self._to_rgb_numpy(pre_image)
         pred_np = unet_pred.cpu().numpy()
         building_mask = np.isin(pred_np, list(self.building_classes))
 
