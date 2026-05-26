@@ -1,4 +1,4 @@
-"""Streamlit prototype for CrisisMap AI U-Net inference."""
+"""Streamlit alpha prototype for Aftermath damage-map inference."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+from PIL import Image, ImageOps
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,15 +30,18 @@ CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "outputs"
     / "checkpoints"
-    / "unet_512_ce_dice_w005_1_4_50epochs"
-    / "best_unet.pt"
+    / "unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs"
+    / "best_unet_portable.pt"
 )
 
-IMAGE_SIZE = 512
+IMAGE_SIZE = 1024
 TARGET_MODE = "3-class"
 BASE_CHANNELS = 32
+CHECKPOINT_LABEL = (
+    "unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs/"
+    "best_unet_portable.pt"
+)
 
-CHECKPOINT_LABEL = "unet_512_ce_dice_w005_1_4_50epochs/best_unet.pt"
 RECOMMENDED_PAIR_IDS_BY_SPLIT = {
     "train": [
         "hurricane-harvey_00000000",
@@ -58,7 +62,17 @@ RECOMMENDED_PAIR_IDS_BY_SPLIT = {
         "hurricane-michael_00000120",
     ],
 }
+JALON3_DEMO_PAIR_IDS = [
+    "hurricane-florence_00000070",
+    "hurricane-florence_00000217",
+    "hurricane-florence_00000153",
+]
 
+CLASS_LABELS = {
+    0: "Fond / absence de bâtiment",
+    1: "Bâtiment non endommagé",
+    2: "Bâtiment endommagé",
+}
 CLASS_COLORS = {
     0: np.array([0, 0, 0], dtype=np.uint8),
     1: np.array([0, 170, 80], dtype=np.uint8),
@@ -74,23 +88,23 @@ class AppError(Exception):
 def load_split(split_name: str) -> pd.DataFrame:
     split_csv = SPLITS_DIR / f"{split_name}_pairs.csv"
     if not split_csv.exists():
-        raise AppError(f"Split CSV not found: {split_csv}")
+        raise AppError(f"Split CSV introuvable : {split_csv}")
     if not split_csv.is_file():
-        raise AppError(f"Split path is not a file: {split_csv}")
+        raise AppError(f"Le chemin du split n'est pas un fichier : {split_csv}")
 
     try:
         df = pd.read_csv(split_csv)
     except OSError as exc:
-        raise AppError(f"Could not read split CSV '{split_csv}': {exc}") from exc
+        raise AppError(f"Impossible de lire le split '{split_csv}' : {exc}") from exc
     except pd.errors.EmptyDataError as exc:
-        raise AppError(f"Split CSV is empty: {split_csv}") from exc
+        raise AppError(f"Le split est vide : {split_csv}") from exc
     except pd.errors.ParserError as exc:
-        raise AppError(f"Could not parse split CSV '{split_csv}': {exc}") from exc
+        raise AppError(f"Impossible de parser le split '{split_csv}' : {exc}") from exc
 
     if "pair_id" not in df.columns:
-        raise AppError(f"Split CSV is missing required column: pair_id")
+        raise AppError("Le split ne contient pas la colonne obligatoire pair_id.")
     if df.empty:
-        raise AppError(f"Split CSV has no rows: {split_csv}")
+        raise AppError(f"Le split ne contient aucune ligne : {split_csv}")
     return df
 
 
@@ -98,9 +112,9 @@ def load_split(split_name: str) -> pd.DataFrame:
 def load_model(checkpoint_path: str, device_name: str) -> UNet:
     checkpoint = Path(checkpoint_path)
     if not checkpoint.exists():
-        raise AppError(f"Checkpoint not found: {checkpoint}")
+        raise AppError(f"Checkpoint introuvable : {checkpoint}")
     if not checkpoint.is_file():
-        raise AppError(f"Checkpoint path is not a file: {checkpoint}")
+        raise AppError(f"Le checkpoint n'est pas un fichier : {checkpoint}")
 
     device = torch.device(device_name)
     model = UNet(in_channels=6, num_classes=3, base_channels=BASE_CHANNELS).to(device)
@@ -110,11 +124,11 @@ def load_model(checkpoint_path: str, device_name: str) -> UNet:
         state_dict = extract_state_dict(loaded)
         model.load_state_dict(state_dict)
     except OSError as exc:
-        raise AppError(f"Could not read checkpoint '{checkpoint}': {exc}") from exc
+        raise AppError(f"Impossible de lire le checkpoint '{checkpoint}' : {exc}") from exc
     except RuntimeError as exc:
         raise AppError(
-            "Checkpoint weights do not match the expected 3-class U-Net "
-            f"configuration at {checkpoint}."
+            "Les poids du checkpoint ne correspondent pas à la configuration "
+            "U-Net 3 classes attendue."
         ) from exc
 
     model.eval()
@@ -135,14 +149,14 @@ def extract_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
         state_dict = checkpoint
 
     if not isinstance(state_dict, dict):
-        raise AppError("Checkpoint is not a state_dict or model checkpoint dict.")
+        raise AppError("Le checkpoint n'est pas un state_dict valide.")
 
     cleaned = {}
     for key, value in state_dict.items():
         if isinstance(value, torch.Tensor):
             cleaned[key.removeprefix("module.")] = value
     if not cleaned:
-        raise AppError("Checkpoint does not contain tensor weights.")
+        raise AppError("Le checkpoint ne contient aucun tenseur de poids.")
     return cleaned
 
 
@@ -158,7 +172,7 @@ def load_sample(split_name: str, pair_id: str) -> dict[str, object]:
         dataset.samples["pair_id"].astype(str) == str(pair_id)
     ].tolist()
     if not matches:
-        raise AppError(f"Pair id '{pair_id}' was not found in {split_csv}.")
+        raise AppError(f"La paire '{pair_id}' est absente de {split_csv}.")
     return dataset[int(matches[0])]
 
 
@@ -167,6 +181,29 @@ def predict(model: UNet, image: torch.Tensor, device_name: str) -> torch.Tensor:
     device = torch.device(device_name)
     logits = model(image.unsqueeze(0).to(device))
     return torch.argmax(logits, dim=1).squeeze(0).cpu()
+
+
+def uploaded_pair_to_tensor(
+    pre_file: object,
+    post_file: object,
+    image_size: int,
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+    pre_image = read_uploaded_image(pre_file, image_size)
+    post_image = read_uploaded_image(post_file, image_size)
+    image = np.concatenate([pre_image, post_image], axis=2)
+    tensor = torch.from_numpy(image.transpose(2, 0, 1).copy())
+    tensor = tensor.to(dtype=torch.float32).div(255.0)
+    return tensor, pre_image, post_image
+
+
+def read_uploaded_image(uploaded_file: object, image_size: int) -> np.ndarray:
+    try:
+        with Image.open(uploaded_file) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image = image.resize((image_size, image_size), Image.BILINEAR)
+            return np.asarray(image, dtype=np.uint8)
+    except OSError as exc:
+        raise AppError(f"Impossible de lire l'image téléversée : {exc}") from exc
 
 
 def tensor_to_rgb(tensor: torch.Tensor) -> np.ndarray:
@@ -196,11 +233,34 @@ def overlay_prediction(post_image: np.ndarray, prediction: np.ndarray) -> np.nda
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
-def prediction_metrics(prediction: np.ndarray) -> tuple[int, int, float]:
+def prediction_counts(prediction: np.ndarray) -> tuple[int, int, float]:
     building_pixels = int(np.isin(prediction, [1, 2]).sum())
     damaged_pixels = int((prediction == 2).sum())
     damaged_ratio = damaged_pixels / building_pixels if building_pixels else 0.0
     return building_pixels, damaged_pixels, damaged_ratio
+
+
+def sample_metrics(prediction: np.ndarray, target: np.ndarray) -> dict[str, float]:
+    confusion = np.zeros((3, 3), dtype=np.float64)
+    valid = (target >= 0) & (target < 3)
+    indices = target[valid] * 3 + prediction[valid]
+    counts = np.bincount(indices, minlength=9).reshape(3, 3)
+    confusion += counts
+
+    true_positive = np.diag(confusion)
+    total = confusion.sum()
+    unions = confusion.sum(axis=1) + confusion.sum(axis=0) - true_positive
+    iou = np.divide(
+        true_positive,
+        unions,
+        out=np.full(3, np.nan, dtype=np.float64),
+        where=unions > 0,
+    )
+    return {
+        "pixel_accuracy": float(true_positive.sum() / total) if total else 0.0,
+        "mean_iou": float(np.nanmean(iou)) if not np.all(np.isnan(iou)) else 0.0,
+        "iou_damaged": 0.0 if np.isnan(iou[2]) else float(iou[2]),
+    }
 
 
 def render_legend() -> None:
@@ -216,43 +276,80 @@ def render_legend() -> None:
     )
 
 
-def render_model_summary() -> None:
-    st.sidebar.markdown("### Modèle actuel")
+def render_model_summary(device_name: str) -> None:
+    st.sidebar.markdown("### Modèle utilisé")
     st.sidebar.write(f"Checkpoint: `{CHECKPOINT_LABEL}`")
-    st.sidebar.write("Pixel accuracy: `0.9189`")
-    st.sidebar.write("Mean IoU: `0.6363`")
-    st.sidebar.write("IoU damaged: `0.4159`")
-    st.sidebar.write("F1 damaged: `0.5875`")
+    st.sidebar.write(f"Appareil: `{device_name}`")
+    st.sidebar.write(f"Taille d'image: `{IMAGE_SIZE}`")
+    st.sidebar.write(f"Mode cible: `{TARGET_MODE}`")
 
 
-def validate_required_paths() -> None:
+def validate_dataset_paths() -> None:
     if not DATA_ROOT.exists():
-        raise AppError(f"xBD training folder not found: {DATA_ROOT}")
+        raise AppError(f"Dossier xBD introuvable : {DATA_ROOT}")
     if not DATA_ROOT.is_dir():
-        raise AppError(f"xBD training path is not a directory: {DATA_ROOT}")
+        raise AppError(f"Le chemin xBD n'est pas un dossier : {DATA_ROOT}")
     if not SPLITS_DIR.exists():
-        raise AppError(f"Split directory not found: {SPLITS_DIR}")
+        raise AppError(f"Dossier des splits introuvable : {SPLITS_DIR}")
 
 
-def main() -> None:
-    st.set_page_config(page_title="Aftermath", layout="wide")
-    st.title("Aftermath")
-    st.caption("Prototype de cartographie automatique des dommages par imagerie satellite")
+def render_prediction_outputs(
+    pre_image: np.ndarray,
+    post_image: np.ndarray,
+    prediction: np.ndarray,
+    title: str,
+    target: np.ndarray | None = None,
+) -> None:
+    predicted_mask = colorize_mask(prediction)
+    prediction_overlay = overlay_prediction(post_image, prediction)
 
+    st.subheader(title)
+    render_legend()
+
+    if target is not None:
+        building_pixels, damaged_pixels, damaged_ratio = prediction_counts(prediction)
+        metrics = sample_metrics(prediction, target)
+        metric_cols = st.columns(6)
+        metric_cols[0].metric("Pixels bâtiments prédits", f"{building_pixels:,}")
+        metric_cols[1].metric("Pixels endommagés prédits", f"{damaged_pixels:,}")
+        metric_cols[2].metric("Part endommagée prédite", f"{damaged_ratio:.2%}")
+        metric_cols[3].metric("Pixel accuracy", f"{metrics['pixel_accuracy']:.3f}")
+        metric_cols[4].metric("Mean IoU", f"{metrics['mean_iou']:.3f}")
+        metric_cols[5].metric("IoU damaged", f"{metrics['iou_damaged']:.3f}")
+    else:
+        st.info("No ground truth provided — inference only.")
+
+    top_cols = st.columns(2)
+    top_cols[0].image(pre_image, caption="Image avant catastrophe", width="stretch")
+    top_cols[1].image(post_image, caption="Image après catastrophe", width="stretch")
+
+    if target is None:
+        bottom_cols = st.columns(2)
+        bottom_cols[0].image(predicted_mask, caption="Prédiction du modèle", width="stretch")
+        bottom_cols[1].image(
+            prediction_overlay,
+            caption="Superposition sur l'image après catastrophe",
+            width="stretch",
+        )
+    else:
+        bottom_cols = st.columns(3)
+        bottom_cols[0].image(colorize_mask(target), caption="Vérité terrain", width="stretch")
+        bottom_cols[1].image(predicted_mask, caption="Prédiction du modèle", width="stretch")
+        bottom_cols[2].image(
+            prediction_overlay,
+            caption="Superposition sur l'image après catastrophe",
+            width="stretch",
+        )
+
+
+def render_dataset_mode(device_name: str) -> None:
     try:
-        validate_required_paths()
+        validate_dataset_paths()
     except AppError as exc:
         st.error(str(exc))
         st.stop()
 
     split_name = st.sidebar.selectbox("Jeu de données", ["train", "val", "test"], index=2)
-    render_model_summary()
-
-    device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    st.sidebar.write(f"Appareil: `{device_name}`")
-    st.sidebar.write(f"Taille d'image: `{IMAGE_SIZE}`")
-    st.sidebar.write(f"Mode cible: `{TARGET_MODE}`")
-
     try:
         split_df = load_split(split_name)
     except AppError as exc:
@@ -265,21 +362,31 @@ def main() -> None:
     available_recommended_ids = [
         pair_id for pair_id in recommended_for_split if pair_id in all_pair_ids_set
     ]
+    available_demo_ids = [
+        pair_id for pair_id in JALON3_DEMO_PAIR_IDS if pair_id in all_pair_ids_set
+    ]
+
     pair_source = st.sidebar.radio(
         "Sélection des paires",
-        ["Toutes les paires disponibles", "Exemples recommandés"],
+        ["Toutes les paires disponibles", "Exemples recommandés", "Démo Jalon 3"],
     )
     if pair_source == "Exemples recommandés" and available_recommended_ids:
         pair_ids = available_recommended_ids
+    elif pair_source == "Démo Jalon 3" and available_demo_ids:
+        pair_ids = available_demo_ids
     else:
         pair_ids = all_pair_ids
-        if pair_source == "Exemples recommandés":
+        if pair_source != "Toutes les paires disponibles":
             st.sidebar.info(
-                "Aucun exemple recommandé n'est disponible dans ce jeu de données. "
+                "Ces exemples ne sont pas disponibles dans le split courant. "
                 "Toutes les paires sont affichées."
             )
 
-    pair_id = st.selectbox("Paire d’images", pair_ids)
+    st.sidebar.markdown("#### Paires de démo Jalon 3")
+    for pair_id in JALON3_DEMO_PAIR_IDS:
+        st.sidebar.caption(pair_id)
+
+    pair_id = st.selectbox("Paire d'images", pair_ids)
 
     try:
         sample = load_sample(split_name, pair_id)
@@ -287,46 +394,97 @@ def main() -> None:
         prediction = predict(model, sample["image"], device_name)
     except (AppError, XBDDatasetError, RuntimeError, OSError, ValueError) as exc:
         st.error(str(exc))
-        st.info(f"Expected checkpoint: `{CHECKPOINT_PATH}`")
+        st.info(f"Checkpoint attendu : `{CHECKPOINT_PATH}`")
         st.stop()
 
     image_tensor = sample["image"]
     target = sample["target"].detach().cpu().numpy()
     pred = prediction.numpy()
-
     pre_image = tensor_to_rgb(image_tensor[:3])
-    post_image = tensor_to_rgb(image_tensor[3:])
-    target_mask = colorize_mask(target)
-    predicted_mask = colorize_mask(pred)
-    prediction_overlay = overlay_prediction(post_image, pred)
+    post_image = tensor_to_rgb(image_tensor[3:6])
 
-    st.subheader(f"Paire sélectionnée : `{pair_id}`")
-    render_legend()
-
-    building_pixels, damaged_pixels, damaged_ratio = prediction_metrics(pred)
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("Pixels bâtiments prédits", f"{building_pixels:,}")
-    metric_cols[1].metric("Pixels endommagés prédits", f"{damaged_pixels:,}")
-    metric_cols[2].metric("Part endommagée prédite", f"{damaged_ratio:.2%}")
-
-    top_cols = st.columns(2)
-    top_cols[0].image(pre_image, caption="Image avant catastrophe", width="stretch")
-    top_cols[1].image(post_image, caption="Image après catastrophe", width="stretch")
-
-    bottom_cols = st.columns(3)
-    bottom_cols[0].image(target_mask, caption="Vérité terrain", width="stretch")
-    bottom_cols[1].image(predicted_mask, caption="Prédiction du modèle", width="stretch")
-    bottom_cols[2].image(
-        prediction_overlay,
-        caption="Superposition sur l’image après catastrophe",
-        width="stretch",
+    render_prediction_outputs(
+        pre_image=pre_image,
+        post_image=post_image,
+        prediction=pred,
+        target=target,
+        title=f"Paire sélectionnée : `{pair_id}`",
     )
 
     with st.expander("Détails de l'échantillon"):
-        st.write(f"Lignes du jeu sélectionné: `{len(split_df):,}`")
-        st.write(f"Forme du tenseur d'entrée: `{tuple(image_tensor.shape)}`")
-        st.write(f"Classes de vérité terrain: `{np.unique(target).tolist()}`")
-        st.write(f"Classes prédites: `{np.unique(pred).tolist()}`")
+        st.write(f"Lignes du split sélectionné : `{len(split_df):,}`")
+        st.write(f"Forme du tenseur d'entrée : `{tuple(image_tensor.shape)}`")
+        st.write(f"Classes de vérité terrain : `{np.unique(target).tolist()}`")
+        st.write(f"Classes prédites : `{np.unique(pred).tolist()}`")
+
+
+def render_upload_mode(device_name: str) -> None:
+    st.subheader("Upload real image pair")
+    st.write(
+        "Téléversez une image avant catastrophe et une image après catastrophe. "
+        "Les deux images seront redimensionnées au format du modèle pour l'inférence."
+    )
+
+    upload_cols = st.columns(2)
+    pre_file = upload_cols[0].file_uploader(
+        "Pre-disaster image",
+        type=["png", "jpg", "jpeg", "tif", "tiff"],
+        key="upload_pre",
+    )
+    post_file = upload_cols[1].file_uploader(
+        "Post-disaster image",
+        type=["png", "jpg", "jpeg", "tif", "tiff"],
+        key="upload_post",
+    )
+
+    run_clicked = st.button("Run inference", type="primary")
+    if not run_clicked:
+        st.info("Ajoutez les deux images, puis lancez l'inférence.")
+        return
+    if pre_file is None or post_file is None:
+        st.error("Veuillez fournir les deux images : avant et après catastrophe.")
+        return
+
+    try:
+        image_tensor, pre_image, post_image = uploaded_pair_to_tensor(
+            pre_file,
+            post_file,
+            IMAGE_SIZE,
+        )
+        model = load_model(str(CHECKPOINT_PATH), device_name)
+        prediction = predict(model, image_tensor, device_name)
+    except (AppError, RuntimeError, OSError, ValueError) as exc:
+        st.error(str(exc))
+        st.info(f"Checkpoint attendu : `{CHECKPOINT_PATH}`")
+        st.stop()
+
+    render_prediction_outputs(
+        pre_image=pre_image,
+        post_image=post_image,
+        prediction=prediction.numpy(),
+        target=None,
+        title="Résultat d'inférence sur images téléversées",
+    )
+
+
+def main() -> None:
+    st.set_page_config(page_title="Aftermath", layout="wide")
+    st.title("Aftermath")
+    st.caption("Prototype de cartographie automatique des dommages par imagerie satellite")
+
+    device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    render_model_summary(device_name)
+
+    mode = st.sidebar.radio(
+        "Mode",
+        ["Dataset xBD", "Upload real image pair"],
+        help="Le mode upload ne nécessite pas de vérité terrain.",
+    )
+
+    if mode == "Dataset xBD":
+        render_dataset_mode(device_name)
+    else:
+        render_upload_mode(device_name)
 
 
 if __name__ == "__main__":
