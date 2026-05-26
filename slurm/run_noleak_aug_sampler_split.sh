@@ -138,8 +138,7 @@ rebuild_summary() {
     --epochs "$EPOCHS" \
     --augment-prob "$AUGMENT_PROB" \
     --damage-augment-threshold "$DAMAGE_AUGMENT_THRESHOLD" \
-    --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD" \
-    --variants "${COMBOS[@]}"
+    --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD"
 
   python scripts/rebuild_noleak_aug_sampler_summary.py \
     --output "$PART_SUMMARY_CSV" \
