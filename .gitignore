@@ -60,6 +60,8 @@ Thumbs.db
 # Local milestone ZIP staging folders
 RENDU_JALON_2_Aftermath/
 RENDU_JALON_2_Aftermath.zip
+RENDU_JALON_3_Aftermath/
+RENDU_JALON_3_Aftermath.zip
 
 # Model weights and exported models
 *.pt
