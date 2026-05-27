@@ -172,6 +172,9 @@ Modèles et évaluation :
 - `scripts/evaluate_oracle_building_mask_gain.py` : mesure le gain théorique d'un masque bâtiment parfait.
 - `scripts/train_building_segmentation.py` : entraîne la segmentation binaire fond/bâtiment.
 - `scripts/evaluate_building_segmentation.py` : évalue un checkpoint building-only.
+- `scripts/evaluate_damage_with_predicted_building_mask.py` : compare la prédiction damage brute, le masque bâtiment prédit et les oracles.
+- `scripts/rebuild_noleak_aug_sampler_summary.py` : reconstruit le résumé de la campagne augmentation/sampler damage.
+- `scripts/rebuild_building100_summary.py` : reconstruit le résumé de la campagne Building100.
 
 Interface :
 
@@ -181,6 +184,8 @@ Cluster :
 
 - `slurm/setup_rorqual.sh` : préparation côté Rorqual.
 - `slurm/*.sbatch` : jobs d'entraînement, sweeps et évaluations.
+- `slurm/submit_long250_aug_sampler_campaign.sh` : soumet les longs runs damage sélectionnés.
+- `slurm/submit_building100_sweep_v1.sh` : soumet la campagne large building-only.
 
 ## 9. Erreurs fréquentes à éviter
 
@@ -302,7 +307,11 @@ Soumettre un job :
 ```bash
 sbatch slurm/smoke_unet_512.sbatch
 sbatch slurm/sweep_unet_1024_noleak_aug_sampler_100epochs_match_hist1000.sbatch
+bash slurm/submit_long250_aug_sampler_campaign.sh
+bash slurm/submit_building100_sweep_v1.sh
 ```
+
+La campagne damage augmentation/sampler de Jalon 3 compte 32 runs terminés. Les campagnes suivantes servent à comparer les meilleurs candidats à 250 epochs et à chercher un meilleur segmentateur bâtiment. Les jobs longs écrivent des CSV de résumé dans `outputs/predictions/`.
 
 Vérifier un job sans polling agressif :
 
