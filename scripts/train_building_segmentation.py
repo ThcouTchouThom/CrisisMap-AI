@@ -209,7 +209,8 @@ def parse_args() -> argparse.Namespace:
         default="building-binary",
         help="Only building-binary is supported by this script.",
     )
-    parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--resume", dest="resume_checkpoint", type=Path, default=None)
+    parser.add_argument("--resume-checkpoint", dest="resume_checkpoint", type=Path, default=None)
     parser.add_argument("--focal-alpha", type=float, default=0.25)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--focal-tversky-alpha", type=float, default=0.3)
@@ -778,7 +779,14 @@ def load_resume_checkpoint(
         state_dict = checkpoint["model_state_dict"]
         epoch = int(checkpoint.get("epoch", 0))
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except (RuntimeError, ValueError, KeyError) as exc:
+                print(
+                    "WARNING: Could not load optimizer_state_dict; "
+                    f"resuming model weights only. Details: {exc}",
+                    file=sys.stderr,
+                )
     else:
         state_dict = checkpoint
         epoch = 0
@@ -928,8 +936,8 @@ def train(args: argparse.Namespace) -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     start_epoch = 1
-    if args.resume is not None:
-        start_epoch = load_resume_checkpoint(args.resume, model, optimizer, device)
+    if args.resume_checkpoint is not None:
+        start_epoch = load_resume_checkpoint(args.resume_checkpoint, model, optimizer, device)
 
     best_metric = metric_or_default(output_dir / "best_val_metrics.json", "building_iou", -1.0)
     history: list[dict[str, object]] = []
@@ -940,8 +948,18 @@ def train(args: argparse.Namespace) -> None:
                 existing_history = json.load(file)
             if isinstance(existing_history, list):
                 history = existing_history
+            elif isinstance(existing_history, dict) and isinstance(
+                existing_history.get("history"), list
+            ):
+                history = existing_history["history"]
         except (OSError, json.JSONDecodeError):
             history = []
+    if args.resume_checkpoint is not None:
+        history = [
+            item
+            for item in history
+            if isinstance(item, dict) and int(item.get("epoch", 0) or 0) < start_epoch
+        ]
 
     print("CrisisMap AI - Building Segmentation Training")
     print("=" * 49)
@@ -959,6 +977,9 @@ def train(args: argparse.Namespace) -> None:
     print(f"Sampler: {args.sampler}")
     print(f"Sampler alpha: {args.sampler_alpha}")
     print(f"Log every: {args.log_every} batches")
+    if args.resume_checkpoint is not None:
+        print(f"Resume checkpoint: {args.resume_checkpoint}")
+        print(f"Starting epoch: {start_epoch}")
 
     started_at = time.time()
     for epoch in range(start_epoch, args.epochs + 1):

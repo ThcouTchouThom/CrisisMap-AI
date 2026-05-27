@@ -110,7 +110,7 @@ run_job() {
     echo "FORCE=1: removing prior outputs for this experiment."
     rm -rf -- "$OUTPUT_DIR" "$EXAMPLES_DIR"
     rm -f -- "$METRICS_JSON" "$METRICS_CSV"
-  elif history_complete "$HISTORY_JSON" "$EPOCHS" && [ -f "$METRICS_JSON" ]; then
+  elif history_complete "$HISTORY_JSON" "$EPOCHS" && [ -f "$METRICS_JSON" ] && [ -f "$METRICS_CSV" ]; then
     echo "Complete run and metrics found; skipping."
     rebuild_summary
     return 0
@@ -128,14 +128,14 @@ run_job() {
       echo "WARNING: Incomplete output folder; not evaluating partial checkpoint."
       echo "WARNING: Relaunch with FORCE_INCOMPLETE=1 or RESUME_INCOMPLETE=1."
       rebuild_summary
-      return 0
+      return 1
     fi
   fi
 
   if ! history_complete "$HISTORY_JSON" "$EPOCHS"; then
     resume_args=()
     if [ "$RESUME_INCOMPLETE" = "1" ] && [ -f "$LAST_CHECKPOINT" ]; then
-      resume_args=(--resume "$LAST_CHECKPOINT")
+      resume_args=(--resume-checkpoint "$LAST_CHECKPOINT")
     fi
 
     python -u scripts/train_building_segmentation.py \
@@ -165,7 +165,7 @@ run_job() {
     exit 1
   fi
 
-  if [ ! -f "$METRICS_JSON" ]; then
+  if [ ! -f "$METRICS_JSON" ] || [ ! -f "$METRICS_CSV" ]; then
     python -u scripts/evaluate_building_segmentation.py \
       --checkpoint "$BEST_CHECKPOINT" \
       --root "$ROOT" \

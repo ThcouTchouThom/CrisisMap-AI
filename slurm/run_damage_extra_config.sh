@@ -136,10 +136,8 @@ run_job() {
     if history_complete "$HISTORY_JSON" "$EPOCHS" && [ -f "$BEST_CHECKPOINT" ]; then
       echo "Training complete; evaluating missing metrics."
     elif [ "$RESUME_INCOMPLETE" = "1" ] && [ -f "$LAST_CHECKPOINT" ]; then
-      echo "WARNING: RESUME_INCOMPLETE=1 was requested, but train_unet.py does not expose resume."
-      echo "WARNING: Refusing to evaluate partial checkpoint. Relaunch with FORCE_INCOMPLETE=1 to retrain."
-      rebuild_summary
-      return 0
+      echo "RESUME_INCOMPLETE=1: resuming from last_unet.pt."
+      rm -f -- "$METRICS_JSON"
     elif [ "$FORCE_INCOMPLETE" = "1" ]; then
       echo "FORCE_INCOMPLETE=1: removing incomplete output before retraining."
       rm -rf -- "$OUTPUT_DIR"
@@ -148,11 +146,16 @@ run_job() {
       echo "WARNING: Incomplete output folder; not evaluating partial checkpoint: $OUTPUT_DIR"
       echo "WARNING: Relaunch with FORCE_INCOMPLETE=1 to retrain only this incomplete run."
       rebuild_summary
-      return 0
+      return 1
     fi
   fi
 
   if ! history_complete "$HISTORY_JSON" "$EPOCHS"; then
+    resume_args=()
+    if [ "$RESUME_INCOMPLETE" = "1" ] && [ -f "$LAST_CHECKPOINT" ]; then
+      resume_args=(--resume-checkpoint "$LAST_CHECKPOINT")
+    fi
+
     python -u -m src.crisismap.training.train_unet \
       --root "$ROOT" \
       --train-csv "$TRAIN_CSV" \
@@ -171,7 +174,8 @@ run_job() {
       --damage-augment-threshold "$DAMAGE_AUGMENT_THRESHOLD" \
       --sampler "$SAMPLER" \
       --damage-sampling-alpha "$DAMAGE_SAMPLING_ALPHA" \
-      --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD"
+      --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD" \
+      "${resume_args[@]}"
   fi
 
   if ! history_complete "$HISTORY_JSON" "$EPOCHS" || [ ! -f "$BEST_CHECKPOINT" ]; then

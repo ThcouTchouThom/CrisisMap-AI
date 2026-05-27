@@ -139,6 +139,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional device string, for example cuda, cuda:0, or cpu.",
     )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional last_unet.pt checkpoint to resume training from.",
+    )
     return parser.parse_args()
 
 
@@ -548,6 +554,105 @@ def write_metrics_history(path: Path, history: list[dict[str, object]]) -> None:
         json.dump(serializable_history, file, indent=2)
 
 
+def load_checkpoint_file(path: Path, device: torch.device) -> object:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def clean_state_dict(state_dict: object) -> dict[str, torch.Tensor]:
+    if not isinstance(state_dict, dict):
+        raise TrainingError("Checkpoint does not contain a valid state_dict.")
+    cleaned = {}
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            cleaned[str(key).removeprefix("module.")] = value
+    if not cleaned:
+        raise TrainingError("Checkpoint contains no tensor weights.")
+    return cleaned
+
+
+def load_resume_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> int:
+    checkpoint_path = path.expanduser().resolve()
+    if not checkpoint_path.exists():
+        raise TrainingError(f"Resume checkpoint does not exist: {checkpoint_path}")
+    if not checkpoint_path.is_file():
+        raise TrainingError(f"Resume checkpoint path is not a file: {checkpoint_path}")
+
+    checkpoint = load_checkpoint_file(checkpoint_path, device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        epoch = int(checkpoint.get("epoch", 0))
+        optimizer_state = checkpoint.get("optimizer_state_dict")
+        if optimizer_state is not None:
+            try:
+                optimizer.load_state_dict(optimizer_state)
+            except (RuntimeError, ValueError, KeyError) as exc:
+                print(
+                    "WARNING: Could not load optimizer_state_dict; "
+                    f"resuming model weights only. Details: {exc}",
+                    file=sys.stderr,
+                )
+    else:
+        state_dict = checkpoint
+        epoch = 0
+
+    model.load_state_dict(clean_state_dict(state_dict))
+    return epoch + 1
+
+
+def read_metrics_history(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return []
+    history = (
+        payload
+        if isinstance(payload, list)
+        else payload.get("history") if isinstance(payload, dict) else None
+    )
+    if not isinstance(history, list):
+        return []
+    return [item for item in history if isinstance(item, dict)]
+
+
+def best_mean_iou_from_history(history: list[dict[str, object]]) -> float:
+    best = -1.0
+    for item in history:
+        try:
+            best = max(best, float(item.get("val_mean_iou", -1.0)))
+        except (TypeError, ValueError):
+            pass
+    return best
+
+
+def best_mean_iou_from_checkpoint(path: Path, device: torch.device) -> float:
+    if not path.exists():
+        return -1.0
+    try:
+        checkpoint = load_checkpoint_file(path, device)
+    except (OSError, RuntimeError, ValueError):
+        return -1.0
+    if not isinstance(checkpoint, dict):
+        return -1.0
+    metrics = checkpoint.get("metrics")
+    if not isinstance(metrics, dict):
+        return -1.0
+    try:
+        return float(metrics.get("val_mean_iou", -1.0))
+    except (TypeError, ValueError):
+        return -1.0
+
+
 def autocast_context(use_amp: bool):
     if use_amp:
         return torch.cuda.amp.autocast()
@@ -638,6 +743,16 @@ def train(args: argparse.Namespace) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    start_epoch = 1
+    history: list[dict[str, object]] = []
+    if args.resume_checkpoint is not None:
+        start_epoch = load_resume_checkpoint(args.resume_checkpoint, model, optimizer, device)
+        history = [
+            item
+            for item in read_metrics_history(output_dir / "metrics_history.json")
+            if int(item.get("epoch", 0) or 0) < start_epoch
+        ]
+
     print(f"Device: {device}")
     print(f"Mixed precision: {'enabled' if use_amp else 'disabled'}")
     print(f"Train samples: {len(train_dataset)}")
@@ -651,12 +766,19 @@ def train(args: argparse.Namespace) -> None:
     print(f"Sampler: {args.sampler}")
     print(f"Damage sampling alpha: {args.damage_sampling_alpha}")
     print(f"High damage threshold: {args.high_damage_threshold}")
+    if args.resume_checkpoint is not None:
+        print(f"Resume checkpoint: {args.resume_checkpoint}")
+        print(f"Starting epoch: {start_epoch}")
 
     best_mean_iou = -1.0
-    history: list[dict[str, object]] = []
+    if args.resume_checkpoint is not None:
+        best_mean_iou = max(
+            best_mean_iou_from_history(history),
+            best_mean_iou_from_checkpoint(output_dir / "best_unet.pt", device),
+        )
     start_time = time.time()
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
         train_loss = train_one_epoch(
             model,

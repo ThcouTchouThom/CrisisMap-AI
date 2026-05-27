@@ -85,6 +85,43 @@ Une dependance optionnelle peut etre ajoutee si on veut attendre la campagne Bui
 WAIT_FOR_BUILDING100=1 BUILDING100_DEPENDENCIES=<jobid[:jobid...]> bash slurm/submit_damage_extra_sweep_v1.sh
 ```
 
+## Relaunch apres timeout
+
+Les premiers jobs `damage_extra` ont atteint la limite de temps, mais les checkpoints partiels sont exploitables. Chaque dossier contient `last_unet.pt` avec :
+
+- `epoch`
+- `model_state_dict`
+- `optimizer_state_dict`
+- `metrics`
+- `config`
+- `loss_config`
+
+La reprise est donc possible avec `--resume-checkpoint`, sans evaluer les checkpoints partiels comme resultats officiels.
+
+Commande recommandee :
+
+```bash
+bash slurm/submit_damage_extra_resume.sh
+```
+
+Cette commande utilise `configs/damage_extra_sweep_v1_resume.csv`, avec `08:00:00` pour le run `500 epochs` et `04:00:00` pour les autres runs. Elle soumet les memes 5 configurations avec `RESUME_INCOMPLETE=1`.
+
+Regles de securite :
+
+- run complet + metriques test presentes : skip ;
+- historique complet mais metriques test absentes : evaluation seulement ;
+- run incomplet + `RESUME_INCOMPLETE=1` + `last_unet.pt` : reprise ;
+- run incomplet + `FORCE_INCOMPLETE=1` : suppression du dossier incomplet puis reentrainement ;
+- run incomplet sans option explicite : arret propre, pas d'evaluation.
+
+Les metriques officielles ne sont produites qu'apres entrainement complet et evaluation test.
+
+Audit :
+
+```bash
+python scripts/audit_campaign_completion.py --campaign damage_extra
+```
+
 ## Comparaison attendue
 
 Les resultats seront compares a deux references :

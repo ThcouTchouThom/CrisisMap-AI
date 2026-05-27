@@ -243,3 +243,52 @@ Les faux nuages pourraient simuler des artefacts réalistes, mais ils risquent a
 - flou léger.
 
 Les nuages synthétiques pourront être testés plus tard, une fois un baseline building solide établi.
+
+## Relaunch après timeout / correction environnement
+
+Diagnostic Rorqual :
+
+- l'environnement est maintenant corrigé : `timm==1.0.27` et `segmentation_models_pytorch==0.5.0` sont installés dans le venv ;
+- `torch` s'importe correctement ;
+- `torch.cuda.is_available()` peut être `False` sur le login node, ce qui est normal. CUDA doit être vérifié dans un job SLURM GPU ;
+- les trois runs U-Net locaux ont timeout vers 80-82 epochs et possèdent des `last_building.pt` ;
+- les autres jobs SMP ont échoué avant entraînement lorsque les dépendances manquaient.
+
+Le script suivant vérifie l'environnement sans installer automatiquement quoi que ce soit :
+
+```bash
+python scripts/check_rorqual_building_env.py
+```
+
+Relance recommandée :
+
+```bash
+bash slurm/submit_building100_resume_missing.sh
+```
+
+Cette commande utilise `configs/building100_sweep_v1_relaunch.csv` avec des limites de temps plus longues :
+
+- `unet` : `05:00:00`
+- `fpn_effb3` : `06:00:00`
+- `unetplusplus_effb3` : `07:00:00`
+- `deeplabv3plus_resnet50` : `07:00:00`
+- `deeplabv3plus_effb3` : `08:00:00`
+- `unetplusplus_effb4` : `09:00:00`
+- ajout de `+01:00:00` pour `pre-post`, `building-strong` ou les variantes avec sampler.
+
+Règles de sécurité :
+
+- run complet + JSON/CSV test présents : skip ;
+- historique complet mais métriques test absentes : évaluation seulement ;
+- run incomplet + `RESUME_INCOMPLETE=1` + `last_building.pt` : reprise ;
+- run manquant : entraînement normal ;
+- run incomplet sans option explicite : arrêt propre, pas d'évaluation ;
+- `FORCE_INCOMPLETE=1` supprime seulement le run incomplet visé avant réentraînement.
+
+Les métriques officielles ne sont produites qu'après entraînement complet et évaluation test.
+
+Audit :
+
+```bash
+python scripts/audit_campaign_completion.py --campaign building100
+```
