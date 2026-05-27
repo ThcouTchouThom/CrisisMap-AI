@@ -11,7 +11,8 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Subset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 
 PROJECT_SRC = Path(__file__).resolve().parents[1] / "src"
@@ -22,10 +23,18 @@ from crisismap.data.xbd_dataset import XBDDatasetError, XBDPairDataset  # noqa: 
 from crisismap.models.unet import UNet  # noqa: E402
 
 
-MODEL_CHOICES = {"unet", "unetplusplus_effb3"}
+MODEL_CHOICES = {
+    "unet",
+    "unetplusplus_effb3",
+    "unetplusplus_effb4",
+    "deeplabv3plus_resnet50",
+    "deeplabv3plus_effb3",
+    "fpn_effb3",
+}
 INPUT_MODES = {"pre", "post", "pre-post"}
-LOSS_CHOICES = {"bce-dice", "dice-bce", "focal-tversky"}
-AUGMENT_MODES = {"none", "safe"}
+LOSS_CHOICES = {"bce-dice", "dice-bce", "focal-dice", "focal-tversky"}
+AUGMENT_MODES = {"none", "safe", "building-safe", "building-strong"}
+SAMPLER_MODES = {"none", "building-sqrt"}
 
 
 class BuildingTrainingError(Exception):
@@ -33,11 +42,17 @@ class BuildingTrainingError(Exception):
 
 
 class BuildingInputDataset(torch.utils.data.Dataset):
-    """Select pre, post, or pre-post channels from XBDPairDataset samples."""
+    """Select pre, post, or pre-post channels and apply train-only augmentation."""
 
-    def __init__(self, base_dataset: torch.utils.data.Dataset, input_mode: str) -> None:
+    def __init__(
+        self,
+        base_dataset: torch.utils.data.Dataset,
+        input_mode: str,
+        augment_mode: str = "none",
+    ) -> None:
         self.base_dataset = base_dataset
         self.input_mode = validate_input_mode(input_mode)
+        self.augment_mode = validate_augment_mode(augment_mode)
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -54,10 +69,14 @@ class BuildingInputDataset(torch.utils.data.Dataset):
         else:
             raise BuildingTrainingError(f"Unsupported input mode: {self.input_mode}")
 
+        target = sample["target"]
+        if self.augment_mode != "none":
+            image, target = apply_building_augmentation(image, target, self.augment_mode)
+
         return {
             **sample,
             "image": image,
-            "target": sample["target"],
+            "target": target,
         }
 
 
@@ -76,6 +95,23 @@ class BinaryDiceLoss(torch.nn.Module):
         return 1.0 - dice
 
 
+class BinaryFocalLoss(torch.nn.Module):
+    """Binary focal loss for logits and float masks."""
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probabilities = torch.sigmoid(logits)
+        p_t = probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        loss = alpha_t * torch.pow(1.0 - p_t, self.gamma) * bce
+        return loss.mean()
+
+
 class BCEDiceLoss(torch.nn.Module):
     """BCEWithLogits plus binary Dice loss."""
 
@@ -86,6 +122,18 @@ class BCEDiceLoss(torch.nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         return self.bce(logits, targets) + self.dice(logits, targets)
+
+
+class FocalDiceLoss(torch.nn.Module):
+    """Binary focal loss plus Dice loss."""
+
+    def __init__(self, focal_alpha: float = 0.25, focal_gamma: float = 2.0) -> None:
+        super().__init__()
+        self.focal = BinaryFocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        self.dice = BinaryDiceLoss()
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return self.focal(logits, targets) + self.dice(logits, targets)
 
 
 class FocalTverskyLoss(torch.nn.Module):
@@ -140,8 +188,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--augment-mode",
         choices=sorted(AUGMENT_MODES),
-        default="safe",
+        default="building-safe",
         help="Train-only augmentation mode.",
+    )
+    parser.add_argument(
+        "--sampler",
+        choices=sorted(SAMPLER_MODES),
+        default="none",
+        help="Train-only WeightedRandomSampler mode.",
+    )
+    parser.add_argument(
+        "--sampler-alpha",
+        type=float,
+        default=4.0,
+        help="Alpha used by --sampler building-sqrt.",
     )
     parser.add_argument(
         "--target-mode",
@@ -150,6 +210,8 @@ def parse_args() -> argparse.Namespace:
         help="Only building-binary is supported by this script.",
     )
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--focal-alpha", type=float, default=0.25)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--focal-tversky-alpha", type=float, default=0.3)
     parser.add_argument("--focal-tversky-beta", type=float, default=0.7)
     parser.add_argument("--focal-tversky-gamma", type=float, default=0.75)
@@ -175,11 +237,19 @@ def validate_args(args: argparse.Namespace) -> None:
         raise BuildingTrainingError("--num-workers must be non-negative.")
     if args.log_every < 0:
         raise BuildingTrainingError("--log-every must be non-negative.")
+    if args.sampler_alpha < 0:
+        raise BuildingTrainingError("--sampler-alpha must be non-negative.")
     for name in ["max_train_samples", "max_val_samples", "max_test_samples"]:
         value = getattr(args, name)
         if value is not None and value <= 0:
             raise BuildingTrainingError(f"--{name.replace('_', '-')} must be positive.")
-    for name in ["focal_tversky_alpha", "focal_tversky_beta", "focal_tversky_gamma"]:
+    for name in [
+        "focal_alpha",
+        "focal_gamma",
+        "focal_tversky_alpha",
+        "focal_tversky_beta",
+        "focal_tversky_gamma",
+    ]:
         value = getattr(args, name)
         if value <= 0:
             raise BuildingTrainingError(f"--{name.replace('_', '-')} must be positive.")
@@ -191,6 +261,18 @@ def validate_input_mode(input_mode: str) -> str:
             "input_mode must be one of: " + ", ".join(sorted(INPUT_MODES))
         )
     return input_mode
+
+
+def validate_augment_mode(augment_mode: str) -> str:
+    if augment_mode not in AUGMENT_MODES:
+        raise BuildingTrainingError(
+            "augment_mode must be one of: " + ", ".join(sorted(AUGMENT_MODES))
+        )
+    return augment_mode
+
+
+def canonical_augment_mode(augment_mode: str) -> str:
+    return "building-safe" if augment_mode == "safe" else augment_mode
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -226,12 +308,12 @@ def make_dataset(
         split_csv=split_csv,
         image_size=image_size,
         target_mode=target_mode,
-        augment_mode=augment_mode,
-        augment_prob=0.5 if augment_mode != "none" else 0.0,
+        augment_mode="none",
+        augment_prob=0.0,
     )
     if max_samples is not None:
         base_dataset = Subset(base_dataset, range(min(max_samples, len(base_dataset))))
-    return BuildingInputDataset(base_dataset, input_mode)
+    return BuildingInputDataset(base_dataset, input_mode, augment_mode=augment_mode)
 
 
 def make_loader(
@@ -240,11 +322,13 @@ def make_loader(
     num_workers: int,
     shuffle: bool,
     device: torch.device,
+    sampler: WeightedRandomSampler | None = None,
 ) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -262,36 +346,46 @@ def build_model(
     if model_name == "unet":
         return UNet(in_channels=in_channels, num_classes=1, base_channels=32).to(device), "unet"
 
-    if model_name == "unetplusplus_effb3":
-        try:
-            import segmentation_models_pytorch as smp  # type: ignore
+    try:
+        import segmentation_models_pytorch as smp  # type: ignore
+    except ImportError as exc:
+        raise BuildingTrainingError(
+            "segmentation_models_pytorch is required for model "
+            f"'{model_name}'. Install requirements.txt or load the correct Rorqual env."
+        ) from exc
 
-            model = smp.UnetPlusPlus(
-                encoder_name="efficientnet-b3",
-                encoder_weights=None,
-                in_channels=in_channels,
-                classes=1,
-                activation=None,
-            )
-            return model.to(device), "unetplusplus_effb3"
-        except ImportError:
-            print(
-                "WARNING: segmentation_models_pytorch is not installed; "
-                "falling back to the local UNet."
-            )
-        except Exception as exc:
-            print(
-                "WARNING: could not create U-Net++ EfficientNet-B3 model "
-                f"({exc}); falling back to the local UNet."
-            )
-        return UNet(in_channels=in_channels, num_classes=1, base_channels=32).to(device), "unet_fallback"
+    smp_specs = {
+        "unetplusplus_effb3": (smp.UnetPlusPlus, "efficientnet-b3"),
+        "unetplusplus_effb4": (smp.UnetPlusPlus, "efficientnet-b4"),
+        "deeplabv3plus_resnet50": (smp.DeepLabV3Plus, "resnet50"),
+        "deeplabv3plus_effb3": (smp.DeepLabV3Plus, "efficientnet-b3"),
+        "fpn_effb3": (smp.FPN, "efficientnet-b3"),
+    }
+    if model_name not in smp_specs:
+        raise BuildingTrainingError(f"Unsupported model: {model_name}")
 
-    raise BuildingTrainingError(f"Unsupported model: {model_name}")
+    model_class, encoder_name = smp_specs[model_name]
+    try:
+        model = model_class(
+            encoder_name=encoder_name,
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=1,
+            activation=None,
+        )
+    except Exception as exc:
+        raise BuildingTrainingError(
+            f"Could not create SMP model '{model_name}' with encoder "
+            f"'{encoder_name}': {exc}"
+        ) from exc
+    return model.to(device), model_name
 
 
 def build_loss(args: argparse.Namespace) -> torch.nn.Module:
     if args.loss in {"bce-dice", "dice-bce"}:
         return BCEDiceLoss()
+    if args.loss == "focal-dice":
+        return FocalDiceLoss(focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma)
     if args.loss == "focal-tversky":
         return FocalTverskyLoss(
             alpha=args.focal_tversky_alpha,
@@ -323,6 +417,197 @@ def autocast_context(use_amp: bool):
     if use_amp:
         return torch.cuda.amp.autocast()
     return nullcontext()
+
+
+def apply_building_augmentation(
+    image: torch.Tensor,
+    target: torch.Tensor,
+    augment_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    augment_mode = canonical_augment_mode(augment_mode)
+    image, target = apply_building_geometric_augmentation(image, target)
+    image = apply_building_photometric_augmentation(image, augment_mode)
+    return image.contiguous(), target.contiguous()
+
+
+def apply_building_geometric_augmentation(
+    image: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch.rand(()) < 0.5:
+        image = torch.flip(image, dims=(2,))
+        target = torch.flip(target, dims=(1,))
+    if torch.rand(()) < 0.5:
+        image = torch.flip(image, dims=(1,))
+        target = torch.flip(target, dims=(0,))
+
+    rotations = int(torch.randint(0, 4, ()).item())
+    if rotations:
+        image = torch.rot90(image, k=rotations, dims=(1, 2))
+        target = torch.rot90(target, k=rotations, dims=(0, 1))
+    return image, target
+
+
+def apply_building_photometric_augmentation(
+    image: torch.Tensor,
+    augment_mode: str,
+) -> torch.Tensor:
+    if augment_mode == "building-strong":
+        brightness_range = (0.88, 1.12)
+        contrast_range = (0.88, 1.12)
+        gamma_range = (0.90, 1.10)
+        noise_std = 0.018
+        noise_probability = 0.45
+        blur_probability = 0.25
+    else:
+        brightness_range = (0.94, 1.06)
+        contrast_range = (0.94, 1.06)
+        gamma_range = (0.96, 1.04)
+        noise_std = 0.008
+        noise_probability = 0.25
+        blur_probability = 0.12
+
+    image = apply_per_image_photometric(
+        image,
+        start_channel=0,
+        brightness_range=brightness_range,
+        contrast_range=contrast_range,
+        gamma_range=gamma_range,
+        noise_std=noise_std,
+        noise_probability=noise_probability,
+        blur_probability=blur_probability,
+    )
+    if image.shape[0] == 6:
+        image = apply_per_image_photometric(
+            image,
+            start_channel=3,
+            brightness_range=brightness_range,
+            contrast_range=contrast_range,
+            gamma_range=gamma_range,
+            noise_std=noise_std,
+            noise_probability=noise_probability,
+            blur_probability=blur_probability,
+        )
+    return image.clamp(0.0, 1.0)
+
+
+def uniform_float(bounds: tuple[float, float]) -> float:
+    low, high = bounds
+    return float(torch.empty(()).uniform_(low, high).item())
+
+
+def apply_per_image_photometric(
+    image: torch.Tensor,
+    start_channel: int,
+    brightness_range: tuple[float, float],
+    contrast_range: tuple[float, float],
+    gamma_range: tuple[float, float],
+    noise_std: float,
+    noise_probability: float,
+    blur_probability: float,
+) -> torch.Tensor:
+    end_channel = start_channel + 3
+    channels = image[start_channel:end_channel]
+    brightness = uniform_float(brightness_range)
+    contrast = uniform_float(contrast_range)
+    gamma = uniform_float(gamma_range)
+
+    mean = channels.mean(dim=(1, 2), keepdim=True)
+    channels = (channels - mean) * contrast + mean
+    channels = channels * brightness
+    channels = channels.clamp(0.0, 1.0).pow(gamma)
+
+    if torch.rand(()) < noise_probability:
+        channels = channels + torch.randn_like(channels) * noise_std
+    if torch.rand(()) < blur_probability:
+        channels = F.avg_pool2d(
+            channels.unsqueeze(0),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        ).squeeze(0)
+
+    image = image.clone()
+    image[start_channel:end_channel] = channels.clamp(0.0, 1.0)
+    return image
+
+
+def make_train_sampler(
+    dataset: torch.utils.data.Dataset,
+    sampler_mode: str,
+    alpha: float,
+) -> WeightedRandomSampler | None:
+    if sampler_mode == "none":
+        return None
+    if sampler_mode != "building-sqrt":
+        raise BuildingTrainingError(f"Unsupported sampler: {sampler_mode}")
+
+    rows = extract_sample_rows(dataset)
+    building_ratios = rows.apply(sample_building_ratio, axis=1).to_numpy(dtype="float64")
+    ratio_tensor = torch.as_tensor(building_ratios, dtype=torch.double).clamp_min(0.0)
+    weights = (1.0 + float(alpha) * torch.sqrt(ratio_tensor)).numpy()
+    if not torch.isfinite(torch.as_tensor(weights)).all() or (weights <= 0).any():
+        raise BuildingTrainingError("Sampler weights must be finite and positive.")
+
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+    )
+
+
+def extract_sample_rows(dataset: torch.utils.data.Dataset):
+    if isinstance(dataset, BuildingInputDataset):
+        return extract_sample_rows(dataset.base_dataset)
+    if isinstance(dataset, Subset):
+        base_rows = extract_sample_rows(dataset.dataset)
+        return base_rows.iloc[list(dataset.indices)].reset_index(drop=True)
+    if isinstance(dataset, XBDPairDataset):
+        return dataset.samples.reset_index(drop=True)
+    raise BuildingTrainingError("Unsupported dataset type for sampler.")
+
+
+def sample_building_ratio(row) -> float:
+    for column in [
+        "building_ratio",
+        "target_nonzero_ratio",
+        "nonzero_target_ratio",
+        "nonzero_ratio",
+    ]:
+        if column in row.index and not is_missing(row[column]):
+            try:
+                return float(row[column])
+            except (TypeError, ValueError):
+                pass
+
+    if {"target_value_counts", "target_total_pixels"}.issubset(row.index):
+        try:
+            counts = json.loads(str(row["target_value_counts"]))
+            total = int(float(row["target_total_pixels"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0.0
+        if total <= 0 or not isinstance(counts, dict):
+            return 0.0
+        building_pixels = 0
+        for key, value in counts.items():
+            try:
+                target_class = int(float(str(key)))
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if target_class > 0:
+                building_pixels += count
+        return building_pixels / total
+    return 0.0
+
+
+def is_missing(value: object) -> bool:
+    try:
+        import pandas as pd
+
+        return bool(pd.isna(value))
+    except Exception:
+        return value is None
 
 
 def train_one_epoch(
@@ -535,6 +820,9 @@ def write_summary_csv(
         "epochs",
         "lr",
         "loss",
+        "augment_mode",
+        "sampler",
+        "sampler_alpha",
         "val_building_iou",
         "val_building_f1",
         "test_building_iou",
@@ -551,6 +839,9 @@ def write_summary_csv(
         "epochs": args.epochs,
         "lr": args.lr,
         "loss": args.loss,
+        "augment_mode": args.augment_mode,
+        "sampler": args.sampler,
+        "sampler_alpha": args.sampler_alpha,
         "val_building_iou": best_val_metrics.get("building_iou"),
         "val_building_f1": best_val_metrics.get("building_f1"),
         "test_building_iou": None if test_metrics is None else test_metrics.get("building_iou"),
@@ -588,6 +879,7 @@ def print_epoch(epoch: int, train_loss: float, val_metrics: dict[str, object]) -
 
 def train(args: argparse.Namespace) -> None:
     validate_args(args)
+    args.augment_mode = canonical_augment_mode(args.augment_mode)
     output_dir = prepare_output_dir(args.output_dir)
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == "cuda")
@@ -613,12 +905,14 @@ def train(args: argparse.Namespace) -> None:
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise BuildingTrainingError("Train and validation datasets must be non-empty.")
 
+    train_sampler = make_train_sampler(train_dataset, args.sampler, args.sampler_alpha)
     train_loader = make_loader(
         train_dataset,
         args.batch_size,
         args.num_workers,
-        shuffle=True,
+        shuffle=train_sampler is None,
         device=device,
+        sampler=train_sampler,
     )
     val_loader = make_loader(
         val_dataset,
@@ -662,6 +956,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Parameters: {parameter_count(model):,}")
     print(f"Loss: {args.loss}")
     print(f"Augment mode: {args.augment_mode}")
+    print(f"Sampler: {args.sampler}")
+    print(f"Sampler alpha: {args.sampler_alpha}")
     print(f"Log every: {args.log_every} batches")
 
     started_at = time.time()
