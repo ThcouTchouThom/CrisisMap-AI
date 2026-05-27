@@ -24,7 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--damage-config",
         type=Path,
-        default=Path("configs/damage_extra_sweep_v1.csv"),
+        default=None,
+        help=(
+            "Damage extra config CSV. Defaults to "
+            "configs/damage_extra_sweep_v1_resume.csv if present, else original."
+        ),
     )
     parser.add_argument(
         "--building-config",
@@ -38,14 +42,60 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def clean_key(key: object) -> str:
+    return str(key).strip().lstrip("\ufeff") if key is not None else ""
+
+
+def clean_value(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def clean_row(row: dict[object, object]) -> dict[str, str]:
+    return {clean_key(key): clean_value(value) for key, value in row.items()}
+
+
 def read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         raise AuditError(f"Config CSV does not exist: {path}")
-    with path.open("r", newline="", encoding="utf-8") as file:
-        rows = list(csv.DictReader(file))
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        rows = [clean_row(row) for row in reader]
     if not rows:
         raise AuditError(f"Config CSV is empty: {path}")
     return rows
+
+
+def get_required(
+    row: dict[str, str],
+    aliases: list[str],
+    csv_path: Path,
+    row_index: int,
+) -> str:
+    for alias in aliases:
+        key = clean_key(alias)
+        if key in row and row[key] != "":
+            return row[key]
+    raise AuditError(
+        "Missing required CSV field.\n"
+        f"CSV: {csv_path}\n"
+        f"Row index: {row_index}\n"
+        f"Accepted aliases: {aliases}\n"
+        f"Available keys: {list(row.keys())}\n"
+        f"Full row: {row}"
+    )
+
+
+def get_experiment(row: dict[str, str], csv_path: Path, row_index: int) -> str:
+    return get_required(
+        row,
+        ["experiment", "experiment_name", "run_name", "name"],
+        csv_path,
+        row_index,
+    )
+
+
+def get_optional(row: dict[str, str], key: str, default: str = "") -> str:
+    return row.get(key, default)
 
 
 def load_history(path: Path) -> tuple[bool, int, int]:
@@ -95,16 +145,21 @@ def suggested_action(
     return "force_retrain_needed"
 
 
-def damage_rows(config_rows: list[dict[str, str]], checkpoints_dir: Path, output_dir: Path) -> list[dict[str, object]]:
+def damage_rows(
+    config_rows: list[dict[str, str]],
+    checkpoints_dir: Path,
+    output_dir: Path,
+    csv_path: Path,
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for config in config_rows:
-        experiment = config["experiment"]
+    for row_index, config in enumerate(config_rows, start=2):
+        experiment = get_experiment(config, csv_path, row_index)
         checkpoint_dir = checkpoints_dir / experiment
         history_path = checkpoint_dir / "metrics_history.json"
         best_path = checkpoint_dir / "best_unet.pt"
         last_path = checkpoint_dir / "last_unet.pt"
         metrics_path = output_dir / f"{experiment}_test_metrics.json"
-        expected_epochs = int(config["epochs"])
+        expected_epochs = int(get_required(config, ["epochs"], csv_path, row_index))
         history_exists, epoch_count, last_epoch = load_history(history_path)
         history_is_complete = complete_from_history(epoch_count, last_epoch, expected_epochs)
         best_exists = best_path.exists()
@@ -131,29 +186,39 @@ def damage_rows(config_rows: list[dict[str, str]], checkpoints_dir: Path, output
                     metrics_exists,
                     checkpoint_dir.exists(),
                 ),
-                "split": config["split"],
-                "augment_mode": config["augment_mode"],
-                "sampler": config["sampler"],
-                "damage_sampling_alpha": config["damage_sampling_alpha"],
+                "split": get_required(config, ["split"], csv_path, row_index),
+                "augment_mode": get_required(config, ["augment_mode"], csv_path, row_index),
+                "sampler": get_required(config, ["sampler"], csv_path, row_index),
+                "damage_sampling_alpha": get_required(
+                    config,
+                    ["damage_sampling_alpha"],
+                    csv_path,
+                    row_index,
+                ),
                 "model": "",
                 "input_mode": "",
-                "loss": config["loss"],
+                "loss": get_required(config, ["loss"], csv_path, row_index),
             }
         )
     return rows
 
 
-def building_rows(config_rows: list[dict[str, str]], checkpoints_dir: Path, output_dir: Path) -> list[dict[str, object]]:
+def building_rows(
+    config_rows: list[dict[str, str]],
+    checkpoints_dir: Path,
+    output_dir: Path,
+    csv_path: Path,
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for config in config_rows:
-        experiment = config["experiment"]
+    for row_index, config in enumerate(config_rows, start=2):
+        experiment = get_experiment(config, csv_path, row_index)
         checkpoint_dir = checkpoints_dir / experiment
         history_path = checkpoint_dir / "metrics_history.json"
         best_path = checkpoint_dir / "best_building.pt"
         last_path = checkpoint_dir / "last_building.pt"
         metrics_json = output_dir / f"{experiment}_building_test_metrics.json"
         metrics_csv = output_dir / f"{experiment}_building_test_metrics.csv"
-        expected_epochs = int(config["epochs"])
+        expected_epochs = int(get_required(config, ["epochs"], csv_path, row_index))
         history_exists, epoch_count, last_epoch = load_history(history_path)
         history_is_complete = complete_from_history(epoch_count, last_epoch, expected_epochs)
         best_exists = best_path.exists()
@@ -180,13 +245,13 @@ def building_rows(config_rows: list[dict[str, str]], checkpoints_dir: Path, outp
                     metrics_exists,
                     checkpoint_dir.exists(),
                 ),
-                "split": config["train_csv"],
-                "augment_mode": config["augment_mode"],
-                "sampler": config["sampler"],
+                "split": get_required(config, ["train_csv"], csv_path, row_index),
+                "augment_mode": get_required(config, ["augment_mode"], csv_path, row_index),
+                "sampler": get_required(config, ["sampler"], csv_path, row_index),
                 "damage_sampling_alpha": "",
-                "model": config["model"],
-                "input_mode": config["input_mode"],
-                "loss": config["loss"],
+                "model": get_required(config, ["model"], csv_path, row_index),
+                "input_mode": get_required(config, ["input_mode"], csv_path, row_index),
+                "loss": get_required(config, ["loss"], csv_path, row_index),
             }
         )
     return rows
@@ -248,16 +313,31 @@ def resolve_building_config(path: Path | None) -> Path:
     return relaunch if relaunch.exists() else Path("configs/building100_sweep_v1.csv")
 
 
+def resolve_damage_config(path: Path | None) -> Path:
+    if path is not None:
+        return path
+    resume = Path("configs/damage_extra_sweep_v1_resume.csv")
+    return resume if resume.exists() else Path("configs/damage_extra_sweep_v1.csv")
+
+
 def run_audit(args: argparse.Namespace) -> None:
     output_dir = args.output_dir.expanduser()
     checkpoints_dir = args.checkpoints_dir.expanduser()
     if args.campaign == "damage_extra":
-        rows = damage_rows(read_csv(args.damage_config), checkpoints_dir, output_dir)
-    else:
-        rows = building_rows(
-            read_csv(resolve_building_config(args.building_config)),
+        config_path = resolve_damage_config(args.damage_config)
+        rows = damage_rows(
+            read_csv(config_path),
             checkpoints_dir,
             output_dir,
+            config_path,
+        )
+    else:
+        config_path = resolve_building_config(args.building_config)
+        rows = building_rows(
+            read_csv(config_path),
+            checkpoints_dir,
+            output_dir,
+            config_path,
         )
 
     csv_path = output_dir / f"{args.campaign}_audit.csv"
