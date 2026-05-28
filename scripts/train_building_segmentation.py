@@ -186,6 +186,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision.")
     parser.add_argument(
+        "--drop-last-train",
+        action="store_true",
+        help="Drop the final incomplete train batch; val/test loaders are unchanged.",
+    )
+    parser.add_argument(
         "--augment-mode",
         choices=sorted(AUGMENT_MODES),
         default="building-safe",
@@ -324,6 +329,7 @@ def make_loader(
     shuffle: bool,
     device: torch.device,
     sampler: WeightedRandomSampler | None = None,
+    drop_last: bool = False,
 ) -> DataLoader:
     return DataLoader(
         dataset,
@@ -332,6 +338,7 @@ def make_loader(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
+        drop_last=drop_last,
     )
 
 
@@ -921,6 +928,7 @@ def train(args: argparse.Namespace) -> None:
         shuffle=train_sampler is None,
         device=device,
         sampler=train_sampler,
+        drop_last=args.drop_last_train,
     )
     val_loader = make_loader(
         val_dataset,
@@ -928,6 +936,7 @@ def train(args: argparse.Namespace) -> None:
         args.num_workers,
         shuffle=False,
         device=device,
+        drop_last=False,
     )
 
     model, actual_model = build_model(args.model, input_channels(args.input_mode), device)
@@ -976,6 +985,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"Augment mode: {args.augment_mode}")
     print(f"Sampler: {args.sampler}")
     print(f"Sampler alpha: {args.sampler_alpha}")
+    print(f"Drop last train batch: {args.drop_last_train}")
     print(f"Log every: {args.log_every} batches")
     if args.resume_checkpoint is not None:
         print(f"Resume checkpoint: {args.resume_checkpoint}")
@@ -1054,6 +1064,7 @@ def train(args: argparse.Namespace) -> None:
             args.num_workers,
             shuffle=False,
             device=device,
+            drop_last=False,
         )
         load_resume_checkpoint(output_dir / "best_building.pt", model, None, device)
         test_metrics = evaluate(model, test_loader, criterion, device, use_amp)

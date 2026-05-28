@@ -145,6 +145,13 @@ run_job() {
   echo "IMAGE_SIZE=${IMAGE_SIZE} BATCH_SIZE=${BATCH_SIZE} EPOCHS=${EPOCHS}"
   echo "LOSS=${LOSS} CLASS_WEIGHTS=${CLASS_WEIGHTS} LR=${LR}"
   echo "AUGMENT_MODE=${AUGMENT_MODE} SAMPLER=${SAMPLER} ALPHA=${DAMAGE_SAMPLING_ALPHA}"
+  drop_last_args=()
+  if [[ "$MODEL" == *deeplabv3plus* ]]; then
+    drop_last_args=(--drop-last-train)
+    echo "DeepLabV3+ detected: enabling --drop-last-train for train loader BatchNorm safety."
+  else
+    echo "Drop last train batch: false"
+  fi
   echo "Output dir: ${OUTPUT_DIR}"
   echo "History exists: $([ -f "$HISTORY_JSON" ] && echo yes || echo no)"
   echo "History epoch count: $(history_epoch_count "$HISTORY_JSON")"
@@ -209,6 +216,7 @@ run_job() {
       --high-damage-threshold "$HIGH_DAMAGE_THRESHOLD" \
       --base-channels "$BASE_CHANNELS" \
       --amp \
+      "${drop_last_args[@]}" \
       "${resume_args[@]}"
   fi
 

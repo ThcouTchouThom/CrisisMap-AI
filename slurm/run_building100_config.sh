@@ -166,6 +166,13 @@ run_job() {
   echo "Experiment: ${EXPERIMENT}"
   echo "Model=${MODEL} input=${INPUT_MODE} loss=${LOSS} augment=${AUGMENT_MODE}"
   echo "Sampler=${SAMPLER} alpha=${SAMPLER_ALPHA} lr=${LR}"
+  drop_last_args=()
+  if [[ "$MODEL" == deeplabv3plus* ]]; then
+    drop_last_args=(--drop-last-train)
+    echo "DeepLabV3+ detected: enabling --drop-last-train for train loader BatchNorm safety."
+  else
+    echo "Drop last train batch: false"
+  fi
   echo "Train=${TRAIN_CSV}"
   echo "Val=${VAL_CSV}"
   echo "Test=${TEST_CSV}"
@@ -279,6 +286,7 @@ run_job() {
       --sampler "$SAMPLER" \
       --sampler-alpha "$SAMPLER_ALPHA" \
       --target-mode building-binary \
+      "${drop_last_args[@]}" \
       "${resume_args[@]}"
   fi
 

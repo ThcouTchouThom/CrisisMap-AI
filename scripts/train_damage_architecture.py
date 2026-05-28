@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -36,7 +37,6 @@ from crisismap.training.train_unet import (  # noqa: E402
     evaluate,
     load_checkpoint_file,
     make_dataset,
-    make_loader,
     make_train_sampler,
     parameter_count,
     print_epoch_summary,
@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-damage-threshold", type=float, default=0.06)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument(
+        "--drop-last-train",
+        action="store_true",
+        help="Drop the final incomplete train batch; val loaders are unchanged.",
+    )
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     return parser.parse_args()
 
@@ -132,6 +137,26 @@ def resolve_device(device_arg: str | None) -> torch.device:
             raise TrainingError("CUDA device was requested, but CUDA is not available.")
         return device
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def make_loader(
+    dataset: torch.utils.data.Dataset,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    device: torch.device,
+    sampler: WeightedRandomSampler | None = None,
+    drop_last: bool = False,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        drop_last=drop_last,
+    )
 
 
 def load_resume_checkpoint(
@@ -235,6 +260,7 @@ def train(args: argparse.Namespace) -> None:
         shuffle=train_sampler is None,
         device=device,
         sampler=train_sampler,
+        drop_last=args.drop_last_train,
     )
     val_loader = make_loader(
         val_dataset,
@@ -242,6 +268,7 @@ def train(args: argparse.Namespace) -> None:
         args.num_workers,
         shuffle=False,
         device=device,
+        drop_last=False,
     )
 
     model = create_damage_model(
@@ -286,6 +313,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"Sampler: {args.sampler}")
     print(f"Damage sampling alpha: {args.damage_sampling_alpha}")
     print(f"High damage threshold: {args.high_damage_threshold}")
+    print(f"Drop last train batch: {args.drop_last_train}")
     if args.resume_checkpoint is not None:
         print(f"Resume checkpoint: {args.resume_checkpoint}")
         print(f"Starting epoch: {start_epoch}")
