@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 
@@ -26,13 +27,11 @@ from crisismap.models.damage_model_factory import (  # noqa: E402
 )
 from crisismap.training.train_unet import (  # noqa: E402
     AUGMENT_MODES,
-    LOSS_CHOICES,
     SAMPLER_MODES,
     TARGET_MODES,
     TrainingError,
     best_mean_iou_from_checkpoint,
     best_mean_iou_from_history,
-    build_criterion,
     clean_state_dict,
     evaluate,
     load_checkpoint_file,
@@ -44,6 +43,16 @@ from crisismap.training.train_unet import (  # noqa: E402
     train_one_epoch,
     write_metrics_history,
 )
+
+
+DAMAGE_ARCH_LOSS_CHOICES = {
+    "ce",
+    "weighted-ce",
+    "ce-dice",
+    "focal-dice",
+    "focal-tversky",
+}
+DEFAULT_3_CLASS_WEIGHTS = [0.05, 1.0, 4.0]
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--loss", choices=sorted(LOSS_CHOICES), default="ce-dice")
+    parser.add_argument("--loss", choices=sorted(DAMAGE_ARCH_LOSS_CHOICES), default="ce-dice")
     parser.add_argument(
         "--class-weights",
         nargs=3,
@@ -87,6 +96,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-damage-threshold", type=float, default=0.06)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--focal-tversky-alpha", type=float, default=0.3)
+    parser.add_argument("--focal-tversky-beta", type=float, default=0.7)
+    parser.add_argument("--focal-tversky-gamma", type=float, default=0.75)
     parser.add_argument(
         "--drop-last-train",
         action="store_true",
@@ -118,6 +131,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise TrainingError("--damage-sampling-alpha must be non-negative.")
     if args.high_damage_threshold < 0.0:
         raise TrainingError("--high-damage-threshold must be non-negative.")
+    if args.focal_gamma <= 0.0:
+        raise TrainingError("--focal-gamma must be positive.")
+    if args.focal_tversky_alpha < 0.0 or args.focal_tversky_beta < 0.0:
+        raise TrainingError("--focal-tversky-alpha/beta must be non-negative.")
+    if args.focal_tversky_gamma <= 0.0:
+        raise TrainingError("--focal-tversky-gamma must be positive.")
 
 
 def prepare_output_dir(output_dir: Path) -> Path:
@@ -157,6 +176,164 @@ def make_loader(
         pin_memory=device.type == "cuda",
         drop_last=drop_last,
     )
+
+
+class MulticlassDiceLoss(torch.nn.Module):
+    """Mean multiclass Dice loss for logits and integer targets."""
+
+    def __init__(self, num_classes: int, epsilon: float = 1e-6) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.epsilon = epsilon
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probabilities = torch.softmax(logits, dim=1)
+        one_hot = F.one_hot(targets, num_classes=self.num_classes)
+        one_hot = one_hot.permute(0, 3, 1, 2).to(dtype=probabilities.dtype)
+        reduce_dims = (0, 2, 3)
+        intersection = torch.sum(probabilities * one_hot, dim=reduce_dims)
+        denominator = torch.sum(probabilities, dim=reduce_dims) + torch.sum(
+            one_hot,
+            dim=reduce_dims,
+        )
+        dice = (2.0 * intersection + self.epsilon) / (denominator + self.epsilon)
+        return torch.mean(1.0 - dice)
+
+
+class CrossEntropyDiceLoss(torch.nn.Module):
+    """Weighted cross entropy plus multiclass Dice loss."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        class_weights: torch.Tensor | None,
+    ) -> None:
+        super().__init__()
+        self.cross_entropy = torch.nn.CrossEntropyLoss(weight=class_weights)
+        self.dice = MulticlassDiceLoss(num_classes=num_classes)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return self.cross_entropy(logits, targets) + self.dice(logits, targets)
+
+
+class FocalDiceLoss(torch.nn.Module):
+    """Weighted focal cross entropy plus multiclass Dice loss."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        class_weights: torch.Tensor | None,
+        gamma: float,
+    ) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.class_weights = class_weights
+        self.gamma = gamma
+        self.dice = MulticlassDiceLoss(num_classes=num_classes)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(
+            logits,
+            targets,
+            weight=self.class_weights,
+            reduction="none",
+        )
+        pt = torch.exp(-ce)
+        focal = torch.mean(torch.pow(1.0 - pt, self.gamma) * ce)
+        return focal + self.dice(logits, targets)
+
+
+class FocalTverskyLoss(torch.nn.Module):
+    """Mean multiclass focal Tversky loss for logits and integer targets."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        alpha: float,
+        beta: float,
+        gamma: float,
+        epsilon: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.epsilon = epsilon
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probabilities = torch.softmax(logits, dim=1)
+        one_hot = F.one_hot(targets, num_classes=self.num_classes)
+        one_hot = one_hot.permute(0, 3, 1, 2).to(dtype=probabilities.dtype)
+        reduce_dims = (0, 2, 3)
+        true_positive = torch.sum(probabilities * one_hot, dim=reduce_dims)
+        false_positive = torch.sum(probabilities * (1.0 - one_hot), dim=reduce_dims)
+        false_negative = torch.sum((1.0 - probabilities) * one_hot, dim=reduce_dims)
+        tversky = (true_positive + self.epsilon) / (
+            true_positive
+            + self.alpha * false_positive
+            + self.beta * false_negative
+            + self.epsilon
+        )
+        return torch.mean(torch.pow(1.0 - tversky, self.gamma))
+
+
+def resolve_class_weights(
+    loss_name: str,
+    class_weights_arg: list[float] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if loss_name == "ce":
+        return None
+    weights = class_weights_arg if class_weights_arg is not None else DEFAULT_3_CLASS_WEIGHTS
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
+def build_arch_criterion(
+    args: argparse.Namespace,
+    num_classes: int,
+    device: torch.device,
+) -> tuple[torch.nn.Module, dict[str, object]]:
+    weights = resolve_class_weights(args.loss, args.class_weights, device)
+    if args.loss == "ce":
+        criterion = torch.nn.CrossEntropyLoss()
+    elif args.loss == "weighted-ce":
+        criterion = torch.nn.CrossEntropyLoss(weight=weights)
+    elif args.loss == "ce-dice":
+        criterion = CrossEntropyDiceLoss(num_classes=num_classes, class_weights=weights)
+    elif args.loss == "focal-dice":
+        criterion = FocalDiceLoss(
+            num_classes=num_classes,
+            class_weights=weights,
+            gamma=args.focal_gamma,
+        )
+    elif args.loss == "focal-tversky":
+        criterion = FocalTverskyLoss(
+            num_classes=num_classes,
+            alpha=args.focal_tversky_alpha,
+            beta=args.focal_tversky_beta,
+            gamma=args.focal_tversky_gamma,
+        )
+    else:
+        raise TrainingError(f"Unsupported loss: {args.loss}")
+
+    weights_list = None if weights is None else [float(value) for value in weights.cpu()]
+    loss_config = {
+        "loss": args.loss,
+        "target_mode": args.target_mode,
+        "class_weights": weights_list,
+        "focal_gamma": args.focal_gamma if args.loss == "focal-dice" else None,
+        "focal_tversky_alpha": (
+            args.focal_tversky_alpha if args.loss == "focal-tversky" else None
+        ),
+        "focal_tversky_beta": (
+            args.focal_tversky_beta if args.loss == "focal-tversky" else None
+        ),
+        "focal_tversky_gamma": (
+            args.focal_tversky_gamma if args.loss == "focal-tversky" else None
+        ),
+    }
+    return criterion, loss_config
 
 
 def load_resume_checkpoint(
@@ -277,13 +454,7 @@ def train(args: argparse.Namespace) -> None:
         in_channels=6,
         base_channels=args.base_channels,
     ).to(device)
-    criterion, loss_config = build_criterion(
-        loss_name=args.loss,
-        target_mode=args.target_mode,
-        num_classes=num_classes,
-        class_weights_arg=args.class_weights,
-        device=device,
-    )
+    criterion, loss_config = build_arch_criterion(args, num_classes, device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 

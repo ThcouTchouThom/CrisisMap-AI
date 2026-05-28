@@ -36,44 +36,119 @@ class SharedUNetEncoder(nn.Module):
         return [skip1, skip2, skip3, skip4, bottleneck]
 
 
+class SqueezeExcitation(nn.Module):
+    """Lightweight channel attention for fused Siamese features."""
+
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 4)
+        self.block = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.block(x)
+
+
 class FeatureFusionBlock(nn.Module):
-    """Fuse pre, post, and absolute-change features at one encoder level."""
+    """Fuse pre/post feature tensors with a configurable change representation."""
+
+    MODE_FACTORS = {
+        "shared": 3,
+        "absdiff": 2,
+        "abs_signed": 4,
+        "abs_signed_product": 5,
+    }
+
+    def __init__(
+        self,
+        channels: int,
+        mode: str = "shared",
+        attention: bool = False,
+    ) -> None:
+        super().__init__()
+        if mode not in self.MODE_FACTORS:
+            raise ValueError(f"Unsupported fusion mode: {mode}")
+        self.mode = mode
+        self.block = nn.Sequential(
+            nn.Conv2d(channels * self.MODE_FACTORS[mode], channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.attention = SqueezeExcitation(channels) if attention else nn.Identity()
+
+    def forward(self, pre_feat: torch.Tensor, post_feat: torch.Tensor) -> torch.Tensor:
+        signed_change = post_feat - pre_feat
+        abs_change = torch.abs(signed_change)
+
+        if self.mode == "shared":
+            features = [pre_feat, post_feat, abs_change]
+        elif self.mode == "absdiff":
+            features = [post_feat, abs_change]
+        elif self.mode == "abs_signed":
+            features = [pre_feat, post_feat, abs_change, signed_change]
+        elif self.mode == "abs_signed_product":
+            features = [pre_feat, post_feat, abs_change, signed_change, pre_feat * post_feat]
+        else:
+            raise ValueError(f"Unsupported fusion mode: {self.mode}")
+
+        return self.attention(self.block(torch.cat(features, dim=1)))
+
+
+class GatedFusionBlock(nn.Module):
+    """Fuse pre/post features with an abs-change gate."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
         self.block = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
+            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
         )
 
     def forward(self, pre_feat: torch.Tensor, post_feat: torch.Tensor) -> torch.Tensor:
-        change_feat = torch.abs(post_feat - pre_feat)
-        return self.block(torch.cat([pre_feat, post_feat, change_feat], dim=1))
+        abs_change = torch.abs(post_feat - pre_feat)
+        gate = self.gate(abs_change)
+        mixed = gate * post_feat + (1.0 - gate) * pre_feat
+        return self.block(torch.cat([mixed, abs_change], dim=1))
 
 
-class SiameseUNetSharedEncoder(nn.Module):
-    """Shared-encoder Siamese U-Net for 6-channel pre/post xBD inputs.
-
-    The model splits an input tensor into pre-disaster RGB and post-disaster RGB,
-    encodes both streams with the same weights, fuses every encoder level with
-    concat(pre, post, abs(post - pre)), and decodes the fused features into a
-    3-class damage map.
-    """
+class SiameseUNet(nn.Module):
+    """Shared-encoder Siamese U-Net with configurable feature fusion."""
 
     def __init__(
         self,
         in_channels: int = 6,
         num_classes: int = 3,
         base_channels: int = 32,
+        fusion_mode: str = "shared",
+        attention: bool = False,
+        gated: bool = False,
     ) -> None:
         super().__init__()
         if in_channels != 6:
-            raise ValueError("SiameseUNetSharedEncoder expects in_channels=6.")
+            raise ValueError("SiameseUNet expects in_channels=6.")
+        if gated and fusion_mode != "gated":
+            raise ValueError("Set fusion_mode='gated' when gated=True.")
 
+        self.fusion_mode = fusion_mode
         self.encoder = SharedUNetEncoder(in_channels=3, base_channels=base_channels)
         channels = self.encoder.channels
-        self.fusion = nn.ModuleList(FeatureFusionBlock(channels_i) for channels_i in channels)
+        if gated:
+            self.fusion = nn.ModuleList(GatedFusionBlock(channels_i) for channels_i in channels)
+        else:
+            self.fusion = nn.ModuleList(
+                FeatureFusionBlock(channels_i, mode=fusion_mode, attention=attention)
+                for channels_i in channels
+            )
 
         self.dec4 = UpBlock(channels[4], channels[3], channels[3])
         self.dec3 = UpBlock(channels[3], channels[2], channels[2])
@@ -114,14 +189,126 @@ class SiameseUNetSharedEncoder(nn.Module):
         return logits
 
 
+class SiameseUNetSharedEncoder(SiameseUNet):
+    """Original Axis 2 Siamese model: concat(pre, post, abs(post - pre))."""
+
+    def __init__(
+        self,
+        in_channels: int = 6,
+        num_classes: int = 3,
+        base_channels: int = 32,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            fusion_mode="shared",
+        )
+
+
+class SiameseUNetAbsDiff(SiameseUNet):
+    """Siamese U-Net using post features plus absolute feature difference."""
+
+    def __init__(
+        self,
+        in_channels: int = 6,
+        num_classes: int = 3,
+        base_channels: int = 32,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            fusion_mode="absdiff",
+        )
+
+
+class SiameseUNetAbsSigned(SiameseUNet):
+    """Siamese U-Net with absolute and signed feature differences."""
+
+    def __init__(
+        self,
+        in_channels: int = 6,
+        num_classes: int = 3,
+        base_channels: int = 32,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            fusion_mode="abs_signed",
+        )
+
+
+class SiameseUNetAbsSignedProduct(SiameseUNet):
+    """Siamese U-Net with abs, signed, and feature-product fusion."""
+
+    def __init__(
+        self,
+        in_channels: int = 6,
+        num_classes: int = 3,
+        base_channels: int = 32,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            fusion_mode="abs_signed_product",
+        )
+
+
+class SiameseUNetGatedFusion(SiameseUNet):
+    """Siamese U-Net with a learned abs-change gate for pre/post fusion."""
+
+    def __init__(
+        self,
+        in_channels: int = 6,
+        num_classes: int = 3,
+        base_channels: int = 32,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            fusion_mode="gated",
+            gated=True,
+        )
+
+
+class SiameseUNetAttention(SiameseUNet):
+    """Siamese U-Net with channel attention after each fusion projection."""
+
+    def __init__(
+        self,
+        in_channels: int = 6,
+        num_classes: int = 3,
+        base_channels: int = 32,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            fusion_mode="shared",
+            attention=True,
+        )
+
+
 def smoke_test() -> None:
-    model = SiameseUNetSharedEncoder(in_channels=6, num_classes=3, base_channels=16)
+    model_names = [
+        ("shared", SiameseUNetSharedEncoder),
+        ("absdiff", SiameseUNetAbsDiff),
+        ("abs_signed", SiameseUNetAbsSigned),
+        ("abs_signed_product", SiameseUNetAbsSignedProduct),
+        ("gated", SiameseUNetGatedFusion),
+        ("attention", SiameseUNetAttention),
+    ]
     x = torch.randn(1, 6, 256, 256)
-    with torch.no_grad():
-        y = model(x)
-    print(f"Input shape: {tuple(x.shape)}")
-    print(f"Output shape: {tuple(y.shape)}")
-    assert tuple(y.shape) == (1, 3, 256, 256)
+    for name, model_class in model_names:
+        model = model_class(in_channels=6, num_classes=3, base_channels=16)
+        with torch.no_grad():
+            y = model(x)
+        print(f"{name}: {tuple(y.shape)}")
+        assert tuple(y.shape) == (1, 3, 256, 256)
 
 
 if __name__ == "__main__":

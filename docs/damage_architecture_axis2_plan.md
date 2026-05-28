@@ -32,6 +32,38 @@ Les runs U-Net supplémentaires n'ont pas dépassé ce modèle. On garde donc ce
 U-Net comme baseline officielle et on évite de lancer immédiatement de nouveaux
 sweeps U-Net simples.
 
+## Résultats damage_arch_v1
+
+La première vague architecture a été complétée:
+
+- `8/8` jobs terminés;
+- meilleur F1/IoU damaged architecture:
+  `siamese_unet_shared_encoder` sur `splits_noleak_match_hist1000`,
+  augmentation `safe`, sampler `damage-sqrt` alpha `4`;
+- métriques:
+  - mean IoU `0.664873`;
+  - IoU damaged `0.433710`;
+  - precision damaged `0.552586`;
+  - recall damaged `0.668443`;
+  - F1 damaged `0.605018`;
+- meilleur mean IoU architecture:
+  `siamese_unet_shared_encoder` sur `splits_noleak_match_hist_all`,
+  augmentation `safe`, sampler `damage-sqrt` alpha `8`;
+  - mean IoU `0.670295`;
+  - IoU damaged `0.429987`;
+  - recall damaged `0.718134`;
+  - F1 damaged `0.601386`.
+
+Conclusion: Siamese est prometteur, surtout en rappel, mais manque encore de
+précision. Le champion U-Net + TTA d4 reste supérieur:
+
+- mean IoU `0.681574`;
+- IoU damaged `0.461240`;
+- F1 damaged `0.631300`.
+
+On ne lance donc pas encore de long training architecture. La suite est une
+vague v2 large mais courte, centrée sur des variantes Siamese/change-aware.
+
 ## Pourquoi changer d'architecture
 
 Le U-Net local est maintenant un baseline solide: splits no-leak, CE-Dice,
@@ -77,10 +109,17 @@ src/crisismap/models/siamese_unet.py
 src/crisismap/models/damage_model_factory.py
 scripts/train_damage_architecture.py
 scripts/evaluate_damage_architecture.py
+scripts/evaluate_damage_architecture_tta.py
+scripts/evaluate_damage_ensemble.py
+scripts/rebuild_damage_arch_summary.py
 slurm/smoke_damage_architecture.sbatch
 slurm/run_damage_arch_config.sh
 slurm/submit_damage_arch_sweep_v1.sh
+slurm/smoke_damage_arch_v2.sbatch
+slurm/run_damage_arch_v2_config.sh
+slurm/submit_damage_arch_sweep_v2.sh
 configs/damage_arch_sweep_v1.csv
+configs/damage_arch_sweep_v2.csv
 ```
 
 Le fichier `train_unet.py` n'est pas modifié. Le pipeline Axis 2 est séparé pour
@@ -88,7 +127,7 @@ préserver le comportement du baseline existant.
 
 ## Vague 1
 
-La première vague est volontairement compacte:
+La première vague était volontairement compacte:
 
 1. Siamese shared encoder, `splits_noleak_match_hist_all`, safe, sqrt alpha 4.
 2. Siamese shared encoder, `splits_noleak_match_hist1000`, safe, sqrt alpha 4.
@@ -123,9 +162,24 @@ Les modèles doivent être comparés avec:
 
 Note TTA: `scripts/evaluate_damage_tta.py` reste l'outil validé pour le U-Net
 champion. Pour les nouvelles architectures, la première étape est l'évaluation
-standard avec `scripts/evaluate_damage_architecture.py`; la TTA sera étendue au
-model factory uniquement pour les architectures finalistes afin d'éviter de
-dupliquer trop tôt de la logique.
+standard avec `scripts/evaluate_damage_architecture.py`. La TTA architecture est
+maintenant disponible dans `scripts/evaluate_damage_architecture_tta.py`, d'abord
+pour tester les quatre meilleurs checkpoints Siamese v1 et les futurs meilleurs
+checkpoints v2.
+
+## Vague 2
+
+La v2 se concentre sur `24-32` runs courts à `100 epochs`:
+
+- variantes de fusion sur `match_hist1000` et `match_hist_all`;
+- capacité `base48` et `base64`;
+- sampler `damage-sqrt` alpha `2/4/8`;
+- pertes `ce-dice`, `focal-dice`, `focal-tversky`;
+- augmentation `safe` et `damage-aware`;
+- un seul contrôle `smp_unet_effb3_6ch`.
+
+DeepLabV3+ damage et les autres SMP U-Net ne sont pas prioritaires en v2, car
+v1 indique que les variantes explicitement Siamese sont plus pertinentes.
 
 ## Smoke test avant lancement
 
@@ -140,10 +194,11 @@ Ce job instancie chaque architecture du CSV sur H100 et exécute un forward dumm
 
 ## Lancement du sweep, plus tard
 
-Quand le smoke test est validé:
+Quand le smoke test v1 ou v2 est validé:
 
 ```bash
 bash slurm/submit_damage_arch_sweep_v1.sh
+bash slurm/submit_damage_arch_sweep_v2.sh
 ```
 
 Le submitter lance une tâche indépendante par ligne du CSV. Il n'y a pas de

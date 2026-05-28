@@ -6,7 +6,14 @@ from dataclasses import dataclass
 
 import torch.nn as nn
 
-from crisismap.models.siamese_unet import SiameseUNetSharedEncoder
+from crisismap.models.siamese_unet import (
+    SiameseUNetAbsDiff,
+    SiameseUNetAbsSigned,
+    SiameseUNetAbsSignedProduct,
+    SiameseUNetAttention,
+    SiameseUNetGatedFusion,
+    SiameseUNetSharedEncoder,
+)
 from crisismap.models.unet import UNet
 
 
@@ -27,6 +34,41 @@ SUPPORTED_DAMAGE_MODELS: dict[str, DamageModelSpec] = {
         name="siamese_unet_shared_encoder",
         family="siamese",
         description="Shared-encoder Siamese U-Net with multi-level change fusion.",
+    ),
+    "siamese_unet_absdiff": DamageModelSpec(
+        name="siamese_unet_absdiff",
+        family="siamese",
+        description="Siamese U-Net using post features plus absolute feature difference.",
+    ),
+    "siamese_unet_abs_signed": DamageModelSpec(
+        name="siamese_unet_abs_signed",
+        family="siamese",
+        description="Siamese U-Net with absolute and signed feature differences.",
+    ),
+    "siamese_unet_abs_signed_product": DamageModelSpec(
+        name="siamese_unet_abs_signed_product",
+        family="siamese",
+        description="Siamese U-Net with abs, signed, and feature-product fusion.",
+    ),
+    "siamese_unet_gated_fusion": DamageModelSpec(
+        name="siamese_unet_gated_fusion",
+        family="siamese",
+        description="Siamese U-Net with a learned abs-change gate.",
+    ),
+    "siamese_unet_attention": DamageModelSpec(
+        name="siamese_unet_attention",
+        family="siamese",
+        description="Siamese U-Net with channel attention after fusion.",
+    ),
+    "siamese_unet_base48": DamageModelSpec(
+        name="siamese_unet_base48",
+        family="siamese",
+        description="Shared-encoder Siamese U-Net with base_channels=48.",
+    ),
+    "siamese_unet_base64": DamageModelSpec(
+        name="siamese_unet_base64",
+        family="siamese",
+        description="Shared-encoder Siamese U-Net with base_channels=64.",
     ),
     "smp_unet_effb3_6ch": DamageModelSpec(
         name="smp_unet_effb3_6ch",
@@ -115,6 +157,55 @@ def create_damage_model(
             in_channels=in_channels,
             num_classes=num_classes,
             base_channels=base_channels,
+        )
+
+    if canonical_name == "siamese_unet_absdiff":
+        return SiameseUNetAbsDiff(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+        )
+
+    if canonical_name == "siamese_unet_abs_signed":
+        return SiameseUNetAbsSigned(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+        )
+
+    if canonical_name == "siamese_unet_abs_signed_product":
+        return SiameseUNetAbsSignedProduct(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+        )
+
+    if canonical_name == "siamese_unet_gated_fusion":
+        return SiameseUNetGatedFusion(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+        )
+
+    if canonical_name == "siamese_unet_attention":
+        return SiameseUNetAttention(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+        )
+
+    if canonical_name == "siamese_unet_base48":
+        return SiameseUNetSharedEncoder(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=48,
+        )
+
+    if canonical_name == "siamese_unet_base64":
+        return SiameseUNetSharedEncoder(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=64,
         )
 
     return create_smp_damage_model(
