@@ -1,168 +1,161 @@
-# Axis 2 - Stronger damage prediction methods
+# Axe 2 - Architectures plus fortes pour la prédiction des dégâts
 
-## Current baseline
+## Point de départ
 
-The current official damage champion is:
+Le champion officiel actuel reste:
 
 ```text
 unet_1024_long250_noleak_match_hist_all_aug-safe_sampler-damage-sqrt-alpha4_250epochs
 ```
 
-Metrics:
+Métriques sans TTA:
 
-- split: `splits_noleak_match_hist_all`
-- epochs: `250`
-- augmentation: `safe`
-- sampler: `damage-sqrt`
-- alpha: `4`
-- mean IoU: `0.676624`
-- damaged IoU: `0.446452`
-- damaged precision: `0.605233`
-- damaged recall: `0.629871`
-- damaged F1: `0.617307`
+| Métrique | Valeur |
+|---|---:|
+| Mean IoU | 0.676624 |
+| IoU damaged | 0.446452 |
+| Precision damaged | 0.605233 |
+| Recall damaged | 0.629871 |
+| F1 damaged | 0.617307 |
 
-The extra plain U-Net runs did not beat this model:
+La meilleure inférence actuelle utilise le même modèle avec TTA `d4`:
 
-- alpha8, 250 epochs: damaged F1 `0.613364`, damaged IoU `0.442340`
-- alpha4, 500 epochs: damaged F1 `0.613004`, damaged IoU `0.441965`
+| Métrique | Valeur |
+|---|---:|
+| Mean IoU | 0.681574 |
+| IoU damaged | 0.461240 |
+| Precision damaged | 0.635361 |
+| Recall damaged | 0.627289 |
+| F1 damaged | 0.631300 |
 
-Conclusion: the current U-Net is a strong baseline. More plain U-Net sweeps are unlikely to be the best next use of GPU time unless new data or a new loss formulation appears.
+Les runs U-Net supplémentaires n'ont pas dépassé ce modèle. On garde donc ce
+U-Net comme baseline officielle et on évite de lancer immédiatement de nouveaux
+sweeps U-Net simples.
 
-## Immediate next step: TTA
+## Pourquoi changer d'architecture
 
-Before retraining, evaluate the champion with test-time augmentation:
+Le U-Net local est maintenant un baseline solide: splits no-leak, CE-Dice,
+pondérations de classes, augmentation, sampler, 100/250/500 epochs et TTA ont
+été testés. La prochaine amélioration raisonnable doit venir d'une meilleure
+exploitation de la structure `avant/après`, pas seulement d'un autre réglage
+mineur.
 
-- no checkpoint change;
-- no data split change;
-- no training cost;
-- useful signal about prediction stability under flips and rotations.
+## Priorité des architectures
 
-Recommended command:
+1. `siamese_unet_shared_encoder`
+   - entrée 6 canaux divisée en `pre` et `post`;
+   - encodeur partagé pour les deux images;
+   - fusion multi-niveaux par `concat(pre_feat, post_feat, abs(post_feat - pre_feat))`;
+   - décodeur U-Net vers les 3 classes de dégâts.
 
-```powershell
-python scripts\evaluate_damage_tta.py `
-  --checkpoint outputs\checkpoints\unet_1024_long250_noleak_match_hist_all_aug-safe_sampler-damage-sqrt-alpha4_250epochs\best_unet_portable.pt `
-  --root data\raw\xbd\train `
-  --split-csv data\processed\splits_noleak_match_hist_all\test_pairs.csv `
-  --image-size 1024 `
-  --batch-size 2 `
-  --target-mode 3-class `
-  --device cuda `
-  --amp `
-  --num-workers 0 `
-  --tta-modes none flips rot90 d4 `
-  --output-json outputs\predictions\damage_tta_champion_match_hist_all.json `
-  --output-csv outputs\predictions\damage_tta_champion_match_hist_all.csv `
-  --save-examples-dir outputs\figures\damage_tta_champion_match_hist_all `
-  --num-examples 12
+2. Variante change-aware Siamese
+   - la première version est déjà change-aware via les différences de features;
+   - une branche explicite d'entrée `abs(post - pre)` reste une évolution possible,
+     mais elle n'est pas incluse dans la vague 1 pour limiter mémoire et complexité.
+
+TODO Siamese U-Net++: une version nested decoder peut être pertinente, mais elle
+n'est pas implémentée dans cette première passe. La priorité est de valider
+d'abord le modèle Siamese partagé simple avec un smoke test et une vague courte.
+
+3. DeepLabV3+ 6 canaux
+   - `smp_deeplabv3plus_resnet50_6ch`;
+   - `smp_deeplabv3plus_effb3_6ch`.
+
+4. SMP U-Net 6 canaux
+   - `smp_unet_effb3_6ch`;
+   - `smp_unet_resnet50_6ch`.
+
+5. Architectures transformer/change
+   - SegFormer et ChangeFormer sont prometteurs, mais reportés à une vague
+     ultérieure pour éviter une surface de dépendances trop large avant d'avoir
+     validé les modèles CNN/Siamese.
+
+## Fichiers ajoutés
+
+```text
+src/crisismap/models/siamese_unet.py
+src/crisismap/models/damage_model_factory.py
+scripts/train_damage_architecture.py
+scripts/evaluate_damage_architecture.py
+slurm/smoke_damage_architecture.sbatch
+slurm/run_damage_arch_config.sh
+slurm/submit_damage_arch_sweep_v1.sh
+configs/damage_arch_sweep_v1.csv
 ```
 
-Metrics to inspect:
+Le fichier `train_unet.py` n'est pas modifié. Le pipeline Axis 2 est séparé pour
+préserver le comportement du baseline existant.
 
-1. damaged IoU
-2. damaged F1
-3. damaged precision
-4. damaged recall
-5. mean IoU
+## Vague 1
 
-If TTA improves damaged IoU/F1 without excessive recall/precision tradeoff, it can become a default evaluation/deployment option without retraining.
+La première vague est volontairement compacte:
 
-## Why architecture-level improvement is next
+1. Siamese shared encoder, `splits_noleak_match_hist_all`, safe, sqrt alpha 4.
+2. Siamese shared encoder, `splits_noleak_match_hist1000`, safe, sqrt alpha 4.
+3. Siamese shared encoder, `splits_noleak_match_hist_all`, damage-aware, sqrt alpha 4.
+4. Siamese shared encoder, `splits_noleak_match_hist_all`, safe, sqrt alpha 8.
+5. DeepLabV3+ ResNet50 6 canaux, `splits_noleak_match_hist_all`.
+6. DeepLabV3+ EfficientNet-B3 6 canaux, `splits_noleak_match_hist_all`.
+7. SMP U-Net EfficientNet-B3 6 canaux, `splits_noleak_match_hist_all`.
+8. SMP U-Net ResNet50 6 canaux, `splits_noleak_match_hist_all`.
 
-The plain local U-Net has now been tested across:
-
-- image size 512 and 1024;
-- several splits;
-- class weights;
-- CE-Dice;
-- safe and damage-aware augmentation;
-- weighted random sampling;
-- 100, 250, and 500 epoch variants.
-
-The best improvement now likely requires better representations rather than more small hyperparameter sweeps.
-
-## Candidate order
-
-### 1. Siamese U-Net
-
-Purpose: explicitly compare pre-disaster and post-disaster images while keeping the segmentation workflow familiar.
-
-Preferred design:
-
-- shared encoder for pre and post images;
-- feature fusion with `concat(pre, post, abs(post - pre))` or similar;
-- decoder outputs the same 3 damage classes;
-- compatible with 1024 images and batch size 2 on H100.
-
-This is the most domain-aligned next architecture, but it should be implemented carefully rather than rushed.
-
-### 2. U-Net with ResNet/EfficientNet encoder
-
-Purpose: keep U-Net-like decoder behavior while improving encoder features.
-
-First candidates:
-
-- `smp_unet_effb3_6ch`
-- `smp_unet_resnet50_6ch`
-
-These can use 6-channel pre/post input directly with `encoder_weights=None`.
-
-### 3. DeepLabV3+
-
-Purpose: stronger context modeling and atrous spatial features.
-
-First candidates:
-
-- `smp_deeplabv3plus_resnet50_6ch`
-- `smp_deeplabv3plus_effb3_6ch`
-
-### 4. Attention U-Net later
-
-Attention gates may help focus on building regions, but this is a second wave after establishing the SMP baselines and Siamese design.
-
-### 5. SegFormer / ChangeFormer later
-
-These are strong remote-sensing candidates, especially ChangeFormer for pre/post change detection, but they introduce a larger implementation and dependency surface. They should be reserved for a later, cleaner wave once Axis 2 baselines are established.
-
-## Fair comparison protocol
-
-All architecture candidates should use:
-
-- no-leak splits;
-- image size `1024`;
-- target mode `3-class`;
-- input semantics: pre RGB + post RGB, either 6-channel or Siamese two-stream;
-- same metrics as the official baseline:
-  - pixel accuracy;
-  - mean IoU;
-  - IoU per class;
-  - precision/recall/F1 per class;
-  - especially damaged IoU and damaged F1;
-- first pass: `100 epochs`;
-- finalists: `250 epochs`.
-
-The first architecture sweep is defined in:
+Toutes les lignes sont définies dans:
 
 ```text
 configs/damage_arch_sweep_v1.csv
 ```
 
-It is intentionally compact: six planned runs, not a broad 50-run campaign.
+## Protocole de comparaison
 
-## Relationship with Building100
+Les modèles doivent être comparés avec:
 
-The Building100 segmentation sweep is running separately. Its goal is to find a stronger binary building mask model. Later, the best building segmenter can be combined with the best damage model through:
+- splits no-leak;
+- image size `1024`;
+- target mode `3-class`;
+- loss `ce-dice`;
+- class weights `0.05 1.0 4.0`;
+- augmentation `safe` ou `damage-aware`;
+- sampler `damage-sqrt`;
+- métriques: mean IoU, IoU damaged, precision damaged, recall damaged, F1 damaged;
+- première vague: `100 epochs`;
+- finalistes: `250 epochs`;
+- TTA séparée après entraînement, pas pendant l'évaluation standard.
 
-1. predicted-building clipping;
-2. component majority damage smoothing;
-3. future two-stage building segmentation + damage classification.
+Note TTA: `scripts/evaluate_damage_tta.py` reste l'outil validé pour le U-Net
+champion. Pour les nouvelles architectures, la première étape est l'évaluation
+standard avec `scripts/evaluate_damage_architecture.py`; la TTA sera étendue au
+model factory uniquement pour les architectures finalistes afin d'éviter de
+dupliquer trop tôt de la logique.
 
-Axis 2 should therefore proceed in parallel:
+## Smoke test avant lancement
 
-- short-term: TTA for the current champion;
-- next: architecture-level damage models;
-- later: combine with the best building segmentation branch.
+Avant tout entraînement:
 
-## Implementation note
+```bash
+sbatch slurm/smoke_damage_architecture.sbatch
+```
 
-Do not launch the architecture sweep until the model factory and training/evaluation scripts are smoke-tested. The Siamese U-Net should be implemented as a deliberate model module, not as a hurried edit to the existing `train_unet.py`.
+Ce job instancie chaque architecture du CSV sur H100 et exécute un forward dummy
+`[1, 6, 256, 256]`. Il ne lit pas les données et n'écrit pas de checkpoints.
+
+## Lancement du sweep, plus tard
+
+Quand le smoke test est validé:
+
+```bash
+bash slurm/submit_damage_arch_sweep_v1.sh
+```
+
+Le submitter lance une tâche indépendante par ligne du CSV. Il n'y a pas de
+dépendance par défaut et aucun entraînement n'est lancé automatiquement par le
+simple ajout de ces fichiers.
+
+## Relation avec Building100
+
+Le sweep Building100 reste séparé. Il cherche un meilleur masque binaire
+bâtiment. Une fois les meilleurs modèles Axis 2 identifiés, on pourra combiner:
+
+1. meilleur modèle damage;
+2. meilleur modèle building;
+3. clipping ou majorité par composante;
+4. TTA `d4` si elle reste bénéfique.

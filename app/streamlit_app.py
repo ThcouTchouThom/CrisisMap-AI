@@ -41,6 +41,12 @@ CHECKPOINT_LABEL = (
     "unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs/"
     "best_unet_portable.pt"
 )
+TTA_MODE_OPTIONS = {
+    "Rapide: none": "none",
+    "Équilibré: rot90": "rot90",
+    "Qualité maximale: d4": "d4",
+}
+TTA_MODE_LABELS = {value: label for label, value in TTA_MODE_OPTIONS.items()}
 
 RECOMMENDED_PAIR_IDS_BY_SPLIT = {
     "train": [
@@ -177,10 +183,71 @@ def load_sample(split_name: str, pair_id: str) -> dict[str, object]:
 
 
 @torch.no_grad()
-def predict(model: UNet, image: torch.Tensor, device_name: str) -> torch.Tensor:
+def predict(
+    model: UNet,
+    image: torch.Tensor,
+    device_name: str,
+    tta_mode: str,
+) -> torch.Tensor:
     device = torch.device(device_name)
-    logits = model(image.unsqueeze(0).to(device))
+    logits = predict_logits_tta(
+        model=model,
+        image=image.unsqueeze(0).to(device),
+        tta_mode=tta_mode,
+    )
     return torch.argmax(logits, dim=1).squeeze(0).cpu()
+
+
+def tta_ops(tta_mode: str) -> list[tuple[int, bool, bool]]:
+    if tta_mode == "none":
+        return [(0, False, False)]
+    if tta_mode == "rot90":
+        return [(rotation, False, False) for rotation in range(4)]
+    if tta_mode == "d4":
+        return [(rotation, False, False) for rotation in range(4)] + [
+            (rotation, True, False) for rotation in range(4)
+        ]
+    raise AppError(f"Mode TTA non pris en charge : {tta_mode}")
+
+
+def apply_tta_op(tensor: torch.Tensor, op: tuple[int, bool, bool]) -> torch.Tensor:
+    rotations, flip_h, flip_v = op
+    output = torch.rot90(tensor, k=rotations, dims=(-2, -1)) if rotations else tensor
+    if flip_h:
+        output = torch.flip(output, dims=(-1,))
+    if flip_v:
+        output = torch.flip(output, dims=(-2,))
+    return output
+
+
+def invert_tta_op(tensor: torch.Tensor, op: tuple[int, bool, bool]) -> torch.Tensor:
+    rotations, flip_h, flip_v = op
+    output = tensor
+    if flip_v:
+        output = torch.flip(output, dims=(-2,))
+    if flip_h:
+        output = torch.flip(output, dims=(-1,))
+    if rotations:
+        output = torch.rot90(output, k=-rotations, dims=(-2, -1))
+    return output
+
+
+@torch.no_grad()
+def predict_logits_tta(
+    model: UNet,
+    image: torch.Tensor,
+    tta_mode: str,
+) -> torch.Tensor:
+    logits_sum: torch.Tensor | None = None
+    ops = tta_ops(tta_mode)
+    for op in ops:
+        view = apply_tta_op(image, op)
+        logits = model(view)
+        logits = invert_tta_op(logits, op).float()
+        logits_sum = logits if logits_sum is None else logits_sum + logits
+    if logits_sum is None:
+        raise AppError(f"Aucune transformation TTA pour le mode : {tta_mode}")
+    return logits_sum / float(len(ops))
 
 
 def uploaded_pair_to_tensor(
@@ -276,12 +343,13 @@ def render_legend() -> None:
     )
 
 
-def render_model_summary(device_name: str) -> None:
+def render_model_summary(device_name: str, tta_mode: str) -> None:
     st.sidebar.markdown("### Modèle utilisé")
     st.sidebar.write(f"Checkpoint: `{CHECKPOINT_LABEL}`")
     st.sidebar.write(f"Appareil: `{device_name}`")
     st.sidebar.write(f"Taille d'image: `{IMAGE_SIZE}`")
     st.sidebar.write(f"Mode cible: `{TARGET_MODE}`")
+    st.sidebar.write(f"Inférence: `{TTA_MODE_LABELS.get(tta_mode, tta_mode)}`")
 
 
 def validate_dataset_paths() -> None:
@@ -298,12 +366,14 @@ def render_prediction_outputs(
     post_image: np.ndarray,
     prediction: np.ndarray,
     title: str,
+    tta_mode: str,
     target: np.ndarray | None = None,
 ) -> None:
     predicted_mask = colorize_mask(prediction)
     prediction_overlay = overlay_prediction(post_image, prediction)
 
     st.subheader(title)
+    st.caption(f"Mode d'inférence : {TTA_MODE_LABELS.get(tta_mode, tta_mode)}")
     render_legend()
 
     st.markdown("## Résultat principal")
@@ -352,7 +422,7 @@ def render_prediction_outputs(
             metric_cols[5].metric("IoU damaged", f"{metrics['iou_damaged']:.3f}")
 
 
-def render_dataset_mode(device_name: str) -> None:
+def render_dataset_mode(device_name: str, tta_mode: str) -> None:
     try:
         validate_dataset_paths()
     except AppError as exc:
@@ -401,7 +471,7 @@ def render_dataset_mode(device_name: str) -> None:
     try:
         sample = load_sample(split_name, pair_id)
         model = load_model(str(CHECKPOINT_PATH), device_name)
-        prediction = predict(model, sample["image"], device_name)
+        prediction = predict(model, sample["image"], device_name, tta_mode)
     except (AppError, XBDDatasetError, RuntimeError, OSError, ValueError) as exc:
         st.error(str(exc))
         st.info(f"Checkpoint attendu : `{CHECKPOINT_PATH}`")
@@ -418,6 +488,7 @@ def render_dataset_mode(device_name: str) -> None:
         post_image=post_image,
         prediction=pred,
         target=target,
+        tta_mode=tta_mode,
         title=f"Paire sélectionnée : `{pair_id}`",
     )
 
@@ -428,7 +499,7 @@ def render_dataset_mode(device_name: str) -> None:
         st.write(f"Classes prédites : `{np.unique(pred).tolist()}`")
 
 
-def render_upload_mode(device_name: str) -> None:
+def render_upload_mode(device_name: str, tta_mode: str) -> None:
     st.subheader("Téléverser une paire réelle")
     st.write(
         "Téléversez une image avant catastrophe et une image après catastrophe. "
@@ -462,7 +533,7 @@ def render_upload_mode(device_name: str) -> None:
             IMAGE_SIZE,
         )
         model = load_model(str(CHECKPOINT_PATH), device_name)
-        prediction = predict(model, image_tensor, device_name)
+        prediction = predict(model, image_tensor, device_name, tta_mode)
     except (AppError, RuntimeError, OSError, ValueError) as exc:
         st.error(str(exc))
         st.info(f"Checkpoint attendu : `{CHECKPOINT_PATH}`")
@@ -473,6 +544,7 @@ def render_upload_mode(device_name: str) -> None:
         post_image=post_image,
         prediction=prediction.numpy(),
         target=None,
+        tta_mode=tta_mode,
         title="Résultat d'inférence sur images téléversées",
     )
 
@@ -483,7 +555,14 @@ def main() -> None:
     st.caption("Prototype de cartographie automatique des dommages par imagerie satellite")
 
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    render_model_summary(device_name)
+    tta_mode_label = st.sidebar.selectbox(
+        "Mode d'inférence",
+        list(TTA_MODE_OPTIONS.keys()),
+        index=2,
+        help="La qualité maximale utilise la TTA d4 et peut être plus lente.",
+    )
+    tta_mode = TTA_MODE_OPTIONS[tta_mode_label]
+    render_model_summary(device_name, tta_mode)
 
     mode = st.sidebar.radio(
         "Mode",
@@ -492,9 +571,9 @@ def main() -> None:
     )
 
     if mode == "Dataset xBD":
-        render_dataset_mode(device_name)
+        render_dataset_mode(device_name, tta_mode)
     else:
-        render_upload_mode(device_name)
+        render_upload_mode(device_name, tta_mode)
 
 
 if __name__ == "__main__":
