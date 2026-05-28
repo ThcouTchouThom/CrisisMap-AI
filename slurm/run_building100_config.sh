@@ -90,10 +90,75 @@ sys.exit(0)
 PY
 }
 
+history_status() {
+  local history_json="$1"
+  local expected_epochs="$2"
+  if [ ! -f "$history_json" ]; then
+    echo "missing,0,0"
+    return 0
+  fi
+  python - "$history_json" "$expected_epochs" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = int(sys.argv[2])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    print("unreadable,0,0")
+    sys.exit(0)
+history = data if isinstance(data, list) else data.get("history") if isinstance(data, dict) else None
+if not isinstance(history, list):
+    print("invalid,0,0")
+    sys.exit(0)
+epochs = []
+for item in history:
+    if isinstance(item, dict) and "epoch" in item:
+        try:
+            epochs.append(int(item["epoch"]))
+        except (TypeError, ValueError):
+            pass
+last_epoch = max(epochs) if epochs else 0
+state = "complete" if len(history) >= expected and last_epoch >= expected else "incomplete"
+print(f"{state},{len(history)},{last_epoch}")
+PY
+}
+
 rebuild_summary() {
   python scripts/rebuild_building100_summary.py \
     --config "$CONFIG_CSV" \
     --output "$SUMMARY_CSV"
+}
+
+file_bool() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+print_state() {
+  local status="$1"
+  local epoch_count="$2"
+  local last_epoch="$3"
+  local metrics_json_exists
+  local metrics_csv_exists
+
+  metrics_json_exists="$(file_bool "$METRICS_JSON")"
+  metrics_csv_exists="$(file_bool "$METRICS_CSV")"
+  echo "Output dir: ${OUTPUT_DIR}"
+  echo "metrics_history exists: $(file_bool "$HISTORY_JSON")"
+  echo "history status: ${status}"
+  echo "epoch count: ${epoch_count}"
+  echo "last epoch: ${last_epoch}"
+  echo "best_building.pt exists: $(file_bool "$BEST_CHECKPOINT")"
+  echo "last_building.pt exists: $(file_bool "$LAST_CHECKPOINT")"
+  echo "test metrics JSON exists: ${metrics_json_exists}"
+  echo "test metrics CSV exists: ${metrics_csv_exists}"
 }
 
 run_job() {
@@ -106,35 +171,92 @@ run_job() {
   echo "Test=${TEST_CSV}"
   echo "FORCE=${FORCE} FORCE_INCOMPLETE=${FORCE_INCOMPLETE} RESUME_INCOMPLETE=${RESUME_INCOMPLETE}"
 
+  IFS=, read -r history_state epoch_count last_epoch <<< "$(history_status "$HISTORY_JSON" "$EPOCHS")"
+  metrics_complete=0
+  if [ -f "$METRICS_JSON" ] && [ -f "$METRICS_CSV" ]; then
+    metrics_complete=1
+  fi
+  has_any_artifact=0
+  if [ -f "$HISTORY_JSON" ] || [ -f "$BEST_CHECKPOINT" ] || [ -f "$LAST_CHECKPOINT" ] || [ -f "$METRICS_JSON" ] || [ -f "$METRICS_CSV" ]; then
+    has_any_artifact=1
+  fi
+
+  print_state "$history_state" "$epoch_count" "$last_epoch"
+
+  selected_action="train_fresh"
   if [ "$FORCE" = "1" ]; then
+    selected_action="train_fresh"
+    echo "Selected action: ${selected_action} (FORCE=1)"
     echo "FORCE=1: removing prior outputs for this experiment."
     rm -rf -- "$OUTPUT_DIR" "$EXAMPLES_DIR"
     rm -f -- "$METRICS_JSON" "$METRICS_CSV"
-  elif history_complete "$HISTORY_JSON" "$EPOCHS" && [ -f "$METRICS_JSON" ] && [ -f "$METRICS_CSV" ]; then
+  elif [ "$history_state" = "complete" ] && [ "$metrics_complete" = "1" ]; then
+    selected_action="skip"
+    echo "Selected action: ${selected_action}"
     echo "Complete run and metrics found; skipping."
     rebuild_summary
     return 0
+  elif [ "$history_state" = "complete" ] && [ -f "$BEST_CHECKPOINT" ]; then
+    selected_action="evaluate_only"
+    echo "Selected action: ${selected_action}"
+    echo "Training complete; evaluating missing metrics."
   elif [ -d "$OUTPUT_DIR" ]; then
-    if history_complete "$HISTORY_JSON" "$EPOCHS" && [ -f "$BEST_CHECKPOINT" ]; then
-      echo "Training complete; evaluating missing metrics."
+    if [ "$has_any_artifact" = "0" ]; then
+      selected_action="train_fresh"
+      echo "Selected action: ${selected_action} (stale empty output folder)"
+      echo "Stale empty output folder; training from scratch."
+      rm -rf -- "$OUTPUT_DIR" "$EXAMPLES_DIR"
+      rm -f -- "$METRICS_JSON" "$METRICS_CSV"
     elif [ "$RESUME_INCOMPLETE" = "1" ] && [ -f "$LAST_CHECKPOINT" ]; then
+      selected_action="resume"
+      echo "Selected action: ${selected_action}"
       echo "RESUME_INCOMPLETE=1: resuming from last_building.pt."
       rm -f -- "$METRICS_JSON" "$METRICS_CSV"
     elif [ "$FORCE_INCOMPLETE" = "1" ]; then
+      selected_action="train_fresh"
+      echo "Selected action: ${selected_action} (FORCE_INCOMPLETE=1)"
       echo "FORCE_INCOMPLETE=1: removing incomplete output before retraining."
       rm -rf -- "$OUTPUT_DIR" "$EXAMPLES_DIR"
       rm -f -- "$METRICS_JSON" "$METRICS_CSV"
     else
+      selected_action="fail_incomplete"
+      echo "Selected action: ${selected_action}"
       echo "WARNING: Incomplete output folder; not evaluating partial checkpoint."
       echo "WARNING: Relaunch with FORCE_INCOMPLETE=1 or RESUME_INCOMPLETE=1."
       rebuild_summary
       return 1
     fi
+  else
+    selected_action="train_fresh"
+    echo "Selected action: ${selected_action} (missing output folder)"
   fi
 
-  if ! history_complete "$HISTORY_JSON" "$EPOCHS"; then
+  if [ "$selected_action" = "evaluate_only" ]; then
+    :
+  elif [ "$selected_action" = "skip" ]; then
+    return 0
+  fi
+
+  if [ "$selected_action" = "evaluate_only" ]; then
+    if [ ! -f "$BEST_CHECKPOINT" ]; then
+      echo "ERROR: Cannot evaluate without best checkpoint: $BEST_CHECKPOINT" >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$selected_action" = "train_fresh" ] || [ "$selected_action" = "resume" ]; then
+    if [ "$selected_action" = "train_fresh" ]; then
+      :
+    elif [ "$selected_action" = "resume" ]; then
+      :
+    fi
+  fi
+
+  if [ "$selected_action" = "evaluate_only" ]; then
+    true
+  elif ! history_complete "$HISTORY_JSON" "$EPOCHS"; then
     resume_args=()
-    if [ "$RESUME_INCOMPLETE" = "1" ] && [ -f "$LAST_CHECKPOINT" ]; then
+    if [ "$selected_action" = "resume" ] && [ -f "$LAST_CHECKPOINT" ]; then
       resume_args=(--resume-checkpoint "$LAST_CHECKPOINT")
     fi
 
@@ -186,6 +308,7 @@ run_job() {
   fi
 
   rebuild_summary
+  return 0
 }
 
 run_job 2>&1 | tee "$RUN_LOG"
