@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=building_long
 #SBATCH --account=def-zonata_gpu
-#SBATCH --partition=gpubase_bygpu_b2
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
