@@ -114,6 +114,8 @@ Ce résultat motive une future architecture en deux étapes : segmenter les bât
 
 Une branche building-only a été ajoutée pour la tâche binaire `fond / bâtiment`, avec `target = original_target > 0`. Le premier modèle testé est un U-Net++ EfficientNet-B3 en entrée pré-catastrophe, avec focal Tversky. Les métriques préliminaires de validation sont environ `building IoU = 0.6536`, `recall = 0.8120`, `F1 = 0.7905`.
 
+Le premier test downstream avec le masque bâtiment prédit montre que le masque augmente la précision sur la classe endommagée, mais perd encore trop de rappel pour remplacer la prédiction damage brute. La piste reste donc expérimentale tant que le segmentateur bâtiment n'est pas amélioré.
+
 ## Prototype Streamlit
 
 Le prototype alpha Streamlit permet :
@@ -238,6 +240,8 @@ Repères :
 
 Les scripts SLURM incluent des notifications courriel afin d'éviter le polling fréquent du scheduler. Il faut préférer des vérifications ponctuelles avec `squeue -u $USER` et la lecture des logs.
 
+La campagne augmentation/sampler damage de Jalon 3 est terminée avec 32 runs Rorqual. Elle confirme que l'augmentation `damage-aware` est utile, surtout sans sampler, tandis que les samplers augmentent souvent le rappel au prix de la précision. Deux campagnes longues sont ensuite préparées ou lancées : une sélection `long250` pour les meilleurs candidats damage, et une campagne `Building100` plus large pour la segmentation binaire des bâtiments.
+
 ## Livrables
 
 Le dossier local de rendu Jalon 3 est ignoré par Git :
@@ -270,13 +274,13 @@ Terminé :
 
 En cours :
 
-- consolidation de la campagne Rorqual augmentation/sampler ;
-- sélection du meilleur modèle damage ;
-- évaluation test de la segmentation bâtiment.
+- comparaison longue `250 epochs` des meilleurs candidats damage ;
+- campagne `Building100` pour sélectionner un meilleur segmentateur bâtiment ;
+- intégration expérimentale du masque bâtiment prédit dans l'évaluation downstream.
 
 Étapes futures :
 
-- intégrer un masque bâtiment prédit dans le post-processing damage ;
+- intégrer un masque bâtiment prédit seulement s'il améliore les métriques damage ;
 - améliorer les contours et réduire les faux positifs ;
 - revenir à une segmentation multi-niveaux des dommages ;
 - exploiter les geotransforms pour une carte géoréférencée ;
