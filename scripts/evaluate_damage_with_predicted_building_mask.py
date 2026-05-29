@@ -42,6 +42,13 @@ from crisismap.evaluation.evaluate_unet import (  # noqa: E402
     metrics_from_confusion,
 )
 from crisismap.models.unet import UNet  # noqa: E402
+from evaluate_damage_tta import (  # noqa: E402
+    TTA_MODES,
+    TTAEvaluationError,
+    apply_op,
+    invert_op,
+    tta_ops,
+)
 from train_building_segmentation import (  # noqa: E402
     MODEL_CHOICES as BUILDING_MODEL_CHOICES,
     BuildingTrainingError,
@@ -97,6 +104,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--target-mode", choices=["3-class"], default="3-class")
     parser.add_argument("--damage-model", choices=["unet"], default="unet")
+    parser.add_argument(
+        "--damage-tta",
+        choices=sorted(TTA_MODES),
+        default="none",
+        help="Test-time augmentation mode for the damage model only.",
+    )
     parser.add_argument(
         "--building-model",
         choices=sorted(BUILDING_MODEL_CHOICES),
@@ -239,6 +252,25 @@ def autocast_context(use_amp: bool):
     return nullcontext()
 
 
+def predict_damage_logits_tta(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    mode: str,
+    use_amp: bool,
+) -> torch.Tensor:
+    logits_sum: torch.Tensor | None = None
+    ops = tta_ops(mode)
+    for op in ops:
+        view = apply_op(images, op)
+        with autocast_context(use_amp):
+            logits = model(view)
+        logits = invert_op(logits, op).float()
+        logits_sum = logits if logits_sum is None else logits_sum + logits
+    if logits_sum is None:
+        raise DownstreamEvaluationError(f"No TTA operations for mode: {mode}")
+    return logits_sum / float(len(ops))
+
+
 @torch.no_grad()
 def evaluate_downstream(
     damage_model: UNet,
@@ -267,10 +299,16 @@ def evaluate_downstream(
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
+        use_amp = bool(args.amp and device.type == "cuda")
 
-        with autocast_context(bool(args.amp and device.type == "cuda")):
-            damage_logits = damage_model(images)
-            raw_preds = torch.argmax(damage_logits, dim=1)
+        damage_logits = predict_damage_logits_tta(
+            damage_model,
+            images,
+            args.damage_tta,
+            use_amp,
+        )
+        raw_preds = torch.argmax(damage_logits, dim=1)
+        with autocast_context(use_amp):
             building_logits = normalize_building_logits(
                 building_model(select_building_input(images, args.building_input_mode))
             )
@@ -509,6 +547,7 @@ def build_row(mode: str, threshold: str, metrics: dict[str, object]) -> dict[str
     return {
         "mode": mode,
         "threshold": threshold,
+        "damage_tta": None,
         "pixel_accuracy": metrics.get("pixel_accuracy"),
         "mean_iou": metrics.get("mean_iou"),
         "iou_background": metrics.get("iou_background"),
@@ -547,6 +586,8 @@ def build_payload(
     metrics_by_threshold: dict[str, dict[str, dict[str, object]]],
 ) -> dict[str, object]:
     rows = flatten_metrics(metrics_by_threshold)
+    for row in rows:
+        row["damage_tta"] = args.damage_tta
     return {
         "config": {
             "damage_checkpoint": str(args.damage_checkpoint),
@@ -556,6 +597,7 @@ def build_payload(
             "image_size": args.image_size,
             "target_mode": args.target_mode,
             "damage_model": args.damage_model,
+            "damage_tta": args.damage_tta,
             "building_model": args.building_model,
             "building_input_mode": args.building_input_mode,
             "thresholds": args.thresholds,
@@ -602,6 +644,7 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     fieldnames = [
         "mode",
         "threshold",
+        "damage_tta",
         "pixel_accuracy",
         "mean_iou",
         "iou_background",
@@ -621,6 +664,7 @@ def print_summary(payload: dict[str, object]) -> None:
     print("CrisisMap AI - Damage with Predicted Building Mask")
     print("=" * 56)
     print(f"Device: {payload['config']['device']}")
+    print(f"Damage TTA: {payload['config']['damage_tta']}")
     print(f"Evaluated samples: {payload['evaluated_samples']}")
     print()
     print("Metrics")
@@ -836,6 +880,7 @@ def main() -> int:
             print(f"Saved examples in: {args.save_examples_dir.expanduser().resolve()}")
     except (
         DownstreamEvaluationError,
+        TTAEvaluationError,
         XBDDatasetError,
         BuildingTrainingError,
         OSError,
