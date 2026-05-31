@@ -14,14 +14,24 @@ from PIL import Image, ImageOps
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_SRC = PROJECT_ROOT / "src"
+PROJECT_SCRIPTS = PROJECT_ROOT / "scripts"
 if str(PROJECT_SRC) not in sys.path:
     sys.path.insert(0, str(PROJECT_SRC))
+if str(PROJECT_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(PROJECT_SCRIPTS))
 
 from crisismap.data.xbd_dataset import (  # noqa: E402
     XBDDatasetError,
     XBDPairDataset as XBDDataset,
 )
 from crisismap.models.unet import UNet  # noqa: E402
+from train_building_segmentation import (  # noqa: E402
+    BuildingTrainingError,
+    build_model as build_building_model,
+    clean_state_dict as clean_building_state_dict,
+    input_channels as building_input_channels,
+    normalize_logits as normalize_building_logits,
+)
 
 
 DATA_ROOT = PROJECT_ROOT / "data" / "raw" / "xbd" / "train"
@@ -30,23 +40,48 @@ CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "outputs"
     / "checkpoints"
-    / "unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs"
+    / "unet_1024_long250_noleak_match_hist_all_aug-safe_sampler-damage-sqrt-alpha4_250epochs"
     / "best_unet_portable.pt"
+)
+BUILDING_CHECKPOINT_PATH = (
+    PROJECT_ROOT
+    / "outputs"
+    / "checkpoints"
+    / "b100_d_full_pre_unetplusplus_effb4_sampler8_focal_tversky"
+    / "best_building_portable.pt"
 )
 
 IMAGE_SIZE = 1024
 TARGET_MODE = "3-class"
 BASE_CHANNELS = 32
+BUILDING_MODEL_NAME = "unetplusplus_effb4"
+BUILDING_INPUT_MODE = "pre"
+BUILDING_COMPONENT_CONNECTIVITY = 8
 CHECKPOINT_LABEL = (
-    "unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs/"
+    "unet_1024_long250_noleak_match_hist_all_aug-safe_sampler-damage-sqrt-alpha4_250epochs/"
     "best_unet_portable.pt"
 )
-TTA_MODE_OPTIONS = {
-    "Rapide: none": "none",
-    "Équilibré: rot90": "rot90",
-    "Qualité maximale: d4": "d4",
+BUILDING_CHECKPOINT_LABEL = (
+    "b100_d_full_pre_unetplusplus_effb4_sampler8_focal_tversky/"
+    "best_building_portable.pt"
+)
+INFERENCE_MODE_OPTIONS = {
+    "Damage only": {
+        "damage_tta": "none",
+        "use_building": False,
+        "description": "U-Net sans TTA, pour les demos rapides.",
+    },
+    "Damage + TTA d4": {
+        "damage_tta": "d4",
+        "use_building": False,
+        "description": "Pipeline damage officiel avec TTA d4.",
+    },
+    "Damage + TTA d4 + building component majority": {
+        "damage_tta": "d4",
+        "use_building": True,
+        "description": "Pipeline downstream actuel avec masque batiment predit.",
+    },
 }
-TTA_MODE_LABELS = {value: label for label, value in TTA_MODE_OPTIONS.items()}
 
 RECOMMENDED_PAIR_IDS_BY_SPLIT = {
     "train": [
@@ -141,6 +176,49 @@ def load_model(checkpoint_path: str, device_name: str) -> UNet:
     return model
 
 
+@st.cache_resource(show_spinner="Chargement du modele batiment...")
+def load_building_model(
+    checkpoint_path: str,
+    device_name: str,
+    model_name: str,
+    input_mode: str,
+) -> torch.nn.Module:
+    checkpoint = resolve_project_path(checkpoint_path)
+    if not checkpoint.exists():
+        raise AppError(f"Checkpoint batiment introuvable : {checkpoint}")
+    if not checkpoint.is_file():
+        raise AppError(f"Le checkpoint batiment n'est pas un fichier : {checkpoint}")
+
+    device = torch.device(device_name)
+    try:
+        model, _ = build_building_model(
+            model_name,
+            building_input_channels(input_mode),
+            device,
+        )
+        loaded = load_checkpoint_file(checkpoint, device)
+        if isinstance(loaded, dict) and "model_state_dict" in loaded:
+            state_dict = loaded["model_state_dict"]
+        else:
+            state_dict = loaded
+        model.load_state_dict(clean_building_state_dict(state_dict))
+    except (BuildingTrainingError, RuntimeError, OSError) as exc:
+        raise AppError(
+            "Impossible de charger le modele batiment. Verifiez le checkpoint "
+            "et les dependances segmentation-models-pytorch/timm."
+        ) from exc
+
+    model.eval()
+    return model
+
+
+def resolve_project_path(path_text: str) -> Path:
+    path = Path(path_text.strip()).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
 def load_checkpoint_file(path: Path, device: torch.device) -> object:
     try:
         return torch.load(path, map_location=device, weights_only=False)
@@ -187,15 +265,40 @@ def predict(
     model: UNet,
     image: torch.Tensor,
     device_name: str,
-    tta_mode: str,
+    inference_mode: str,
+    building_checkpoint_path: str,
+    building_threshold: float,
 ) -> torch.Tensor:
     device = torch.device(device_name)
+    options = INFERENCE_MODE_OPTIONS[inference_mode]
+    tta_mode = str(options["damage_tta"])
+    image_batch = image.unsqueeze(0).to(device)
     logits = predict_logits_tta(
         model=model,
-        image=image.unsqueeze(0).to(device),
+        image=image_batch,
         tta_mode=tta_mode,
     )
-    return torch.argmax(logits, dim=1).squeeze(0).cpu()
+    raw_prediction = torch.argmax(logits, dim=1)
+    if not bool(options["use_building"]):
+        return raw_prediction.squeeze(0).cpu()
+
+    building_model = load_building_model(
+        building_checkpoint_path,
+        device_name,
+        BUILDING_MODEL_NAME,
+        BUILDING_INPUT_MODE,
+    )
+    building_input = select_building_input(image_batch, BUILDING_INPUT_MODE)
+    building_logits = normalize_building_logits(building_model(building_input))
+    building_probs = torch.sigmoid(building_logits).squeeze(1)
+    building_mask = building_probs >= building_threshold
+    post_processed = component_majority_batch(
+        raw_prediction,
+        building_mask,
+        connectivity=BUILDING_COMPONENT_CONNECTIVITY,
+        device=device,
+    )
+    return post_processed.squeeze(0).cpu()
 
 
 def tta_ops(tta_mode: str) -> list[tuple[int, bool, bool]]:
@@ -248,6 +351,105 @@ def predict_logits_tta(
     if logits_sum is None:
         raise AppError(f"Aucune transformation TTA pour le mode : {tta_mode}")
     return logits_sum / float(len(ops))
+
+
+def select_building_input(images: torch.Tensor, input_mode: str) -> torch.Tensor:
+    if input_mode == "pre":
+        return images[:, :3]
+    if input_mode == "post":
+        return images[:, 3:6]
+    if input_mode == "pre-post":
+        return images
+    raise AppError(f"Mode d'entree batiment non pris en charge : {input_mode}")
+
+
+def component_majority_batch(
+    raw_predictions: torch.Tensor,
+    building_masks: torch.Tensor,
+    connectivity: int,
+    device: torch.device,
+) -> torch.Tensor:
+    outputs = []
+    for prediction_tensor, mask_tensor in zip(raw_predictions, building_masks):
+        prediction = prediction_tensor.detach().cpu().numpy().astype(np.int16, copy=False)
+        building_mask = mask_tensor.detach().cpu().numpy().astype(bool, copy=False)
+        outputs.append(component_majority_single(prediction, building_mask, connectivity))
+    return torch.from_numpy(np.stack(outputs, axis=0)).to(device=device, dtype=torch.long)
+
+
+def component_majority_single(
+    raw_prediction: np.ndarray,
+    building_mask: np.ndarray,
+    connectivity: int,
+) -> np.ndarray:
+    labels, component_count = label_connected_components(building_mask, connectivity)
+    output = np.zeros_like(raw_prediction, dtype=np.int64)
+    for component_id in range(1, component_count + 1):
+        component_mask = labels == component_id
+        component_predictions = raw_prediction[component_mask]
+        no_damage_count = int(np.count_nonzero(component_predictions == 1))
+        damaged_count = int(np.count_nonzero(component_predictions == 2))
+        component_class = 2 if damaged_count > no_damage_count else 1
+        output[component_mask] = component_class
+    return output
+
+
+def label_connected_components(
+    mask: np.ndarray,
+    connectivity: int,
+) -> tuple[np.ndarray, int]:
+    mask = np.asarray(mask, dtype=bool)
+    structure = (
+        np.ones((3, 3), dtype=np.uint8)
+        if connectivity == 8
+        else np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+    )
+
+    try:
+        from scipy import ndimage  # type: ignore
+
+        labels, count = ndimage.label(mask, structure=structure)
+        return labels.astype(np.int32, copy=False), int(count)
+    except ImportError:
+        pass
+
+    try:
+        from skimage.measure import label as skimage_label  # type: ignore
+
+        sk_connectivity = 2 if connectivity == 8 else 1
+        labels = skimage_label(mask, connectivity=sk_connectivity, background=0)
+        return labels.astype(np.int32, copy=False), int(labels.max())
+    except ImportError:
+        return label_connected_components_fallback(mask, connectivity)
+
+
+def label_connected_components_fallback(
+    mask: np.ndarray,
+    connectivity: int,
+) -> tuple[np.ndarray, int]:
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    height, width = mask.shape
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    if connectivity == 8:
+        neighbors.extend([(-1, -1), (-1, 1), (1, -1), (1, 1)])
+
+    current_label = 0
+    for row in range(height):
+        for col in range(width):
+            if not mask[row, col] or labels[row, col] != 0:
+                continue
+            current_label += 1
+            stack = [(row, col)]
+            labels[row, col] = current_label
+            while stack:
+                y, x = stack.pop()
+                for dy, dx in neighbors:
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width:
+                        if mask[ny, nx] and labels[ny, nx] == 0:
+                            labels[ny, nx] = current_label
+                            stack.append((ny, nx))
+    return labels, current_label
 
 
 def uploaded_pair_to_tensor(
@@ -343,13 +545,24 @@ def render_legend() -> None:
     )
 
 
-def render_model_summary(device_name: str, tta_mode: str) -> None:
+def render_model_summary(
+    device_name: str,
+    inference_mode: str,
+    building_checkpoint_path: str,
+    building_threshold: float,
+) -> None:
+    options = INFERENCE_MODE_OPTIONS[inference_mode]
     st.sidebar.markdown("### Modèle utilisé")
-    st.sidebar.write(f"Checkpoint: `{CHECKPOINT_LABEL}`")
+    st.sidebar.write(f"Checkpoint damage: `{CHECKPOINT_LABEL}`")
     st.sidebar.write(f"Appareil: `{device_name}`")
     st.sidebar.write(f"Taille d'image: `{IMAGE_SIZE}`")
     st.sidebar.write(f"Mode cible: `{TARGET_MODE}`")
-    st.sidebar.write(f"Inférence: `{TTA_MODE_LABELS.get(tta_mode, tta_mode)}`")
+    st.sidebar.write(f"Pipeline: `{inference_mode}`")
+    st.sidebar.write(f"TTA damage: `{options['damage_tta']}`")
+    if bool(options["use_building"]):
+        st.sidebar.write(f"Checkpoint bâtiment: `{building_checkpoint_path}`")
+        st.sidebar.write(f"Modèle bâtiment: `{BUILDING_MODEL_NAME}` / `{BUILDING_INPUT_MODE}`")
+        st.sidebar.write(f"Seuil bâtiment: `{building_threshold:.2f}`")
 
 
 def validate_dataset_paths() -> None:
@@ -366,14 +579,20 @@ def render_prediction_outputs(
     post_image: np.ndarray,
     prediction: np.ndarray,
     title: str,
-    tta_mode: str,
+    inference_mode: str,
     target: np.ndarray | None = None,
 ) -> None:
     predicted_mask = colorize_mask(prediction)
     prediction_overlay = overlay_prediction(post_image, prediction)
 
     st.subheader(title)
-    st.caption(f"Mode d'inférence : {TTA_MODE_LABELS.get(tta_mode, tta_mode)}")
+    st.caption(f"Pipeline d'inférence : {inference_mode}")
+    if bool(INFERENCE_MODE_OPTIONS[inference_mode]["use_building"]):
+        st.warning(
+            "Le post-traitement bâtiment améliore les métriques globales actuelles, "
+            "mais il peut encore supprimer de vrais pixels endommagés si la "
+            "segmentation bâtiment les manque."
+        )
     render_legend()
 
     st.markdown("## Résultat principal")
@@ -422,7 +641,12 @@ def render_prediction_outputs(
             metric_cols[5].metric("IoU damaged", f"{metrics['iou_damaged']:.3f}")
 
 
-def render_dataset_mode(device_name: str, tta_mode: str) -> None:
+def render_dataset_mode(
+    device_name: str,
+    inference_mode: str,
+    building_checkpoint_path: str,
+    building_threshold: float,
+) -> None:
     try:
         validate_dataset_paths()
     except AppError as exc:
@@ -471,10 +695,26 @@ def render_dataset_mode(device_name: str, tta_mode: str) -> None:
     try:
         sample = load_sample(split_name, pair_id)
         model = load_model(str(CHECKPOINT_PATH), device_name)
-        prediction = predict(model, sample["image"], device_name, tta_mode)
-    except (AppError, XBDDatasetError, RuntimeError, OSError, ValueError) as exc:
+        prediction = predict(
+            model,
+            sample["image"],
+            device_name,
+            inference_mode,
+            building_checkpoint_path,
+            building_threshold,
+        )
+    except (
+        AppError,
+        XBDDatasetError,
+        BuildingTrainingError,
+        RuntimeError,
+        OSError,
+        ValueError,
+    ) as exc:
         st.error(str(exc))
         st.info(f"Checkpoint attendu : `{CHECKPOINT_PATH}`")
+        if bool(INFERENCE_MODE_OPTIONS[inference_mode]["use_building"]):
+            st.info(f"Checkpoint bâtiment attendu : `{building_checkpoint_path}`")
         st.stop()
 
     image_tensor = sample["image"]
@@ -488,7 +728,7 @@ def render_dataset_mode(device_name: str, tta_mode: str) -> None:
         post_image=post_image,
         prediction=pred,
         target=target,
-        tta_mode=tta_mode,
+        inference_mode=inference_mode,
         title=f"Paire sélectionnée : `{pair_id}`",
     )
 
@@ -499,7 +739,12 @@ def render_dataset_mode(device_name: str, tta_mode: str) -> None:
         st.write(f"Classes prédites : `{np.unique(pred).tolist()}`")
 
 
-def render_upload_mode(device_name: str, tta_mode: str) -> None:
+def render_upload_mode(
+    device_name: str,
+    inference_mode: str,
+    building_checkpoint_path: str,
+    building_threshold: float,
+) -> None:
     st.subheader("Téléverser une paire réelle")
     st.write(
         "Téléversez une image avant catastrophe et une image après catastrophe. "
@@ -533,10 +778,25 @@ def render_upload_mode(device_name: str, tta_mode: str) -> None:
             IMAGE_SIZE,
         )
         model = load_model(str(CHECKPOINT_PATH), device_name)
-        prediction = predict(model, image_tensor, device_name, tta_mode)
-    except (AppError, RuntimeError, OSError, ValueError) as exc:
+        prediction = predict(
+            model,
+            image_tensor,
+            device_name,
+            inference_mode,
+            building_checkpoint_path,
+            building_threshold,
+        )
+    except (
+        AppError,
+        BuildingTrainingError,
+        RuntimeError,
+        OSError,
+        ValueError,
+    ) as exc:
         st.error(str(exc))
         st.info(f"Checkpoint attendu : `{CHECKPOINT_PATH}`")
+        if bool(INFERENCE_MODE_OPTIONS[inference_mode]["use_building"]):
+            st.info(f"Checkpoint bâtiment attendu : `{building_checkpoint_path}`")
         st.stop()
 
     render_prediction_outputs(
@@ -544,7 +804,7 @@ def render_upload_mode(device_name: str, tta_mode: str) -> None:
         post_image=post_image,
         prediction=prediction.numpy(),
         target=None,
-        tta_mode=tta_mode,
+        inference_mode=inference_mode,
         title="Résultat d'inférence sur images téléversées",
     )
 
@@ -555,14 +815,50 @@ def main() -> None:
     st.caption("Prototype de cartographie automatique des dommages par imagerie satellite")
 
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    tta_mode_label = st.sidebar.selectbox(
-        "Mode d'inférence",
-        list(TTA_MODE_OPTIONS.keys()),
-        index=2,
-        help="La qualité maximale utilise la TTA d4 et peut être plus lente.",
+    building_checkpoint_default = str(BUILDING_CHECKPOINT_PATH)
+    building_checkpoint_exists = BUILDING_CHECKPOINT_PATH.exists()
+    inference_modes = list(INFERENCE_MODE_OPTIONS.keys())
+    default_mode = (
+        "Damage + TTA d4 + building component majority"
+        if building_checkpoint_exists
+        else "Damage + TTA d4"
     )
-    tta_mode = TTA_MODE_OPTIONS[tta_mode_label]
-    render_model_summary(device_name, tta_mode)
+    inference_mode = st.sidebar.selectbox(
+        "Pipeline d'inférence",
+        inference_modes,
+        index=inference_modes.index(default_mode),
+        help=(
+            "Le mode downstream ajoute une segmentation bâtiment prédite et "
+            "une décision majoritaire par composante."
+        ),
+    )
+    st.sidebar.caption(str(INFERENCE_MODE_OPTIONS[inference_mode]["description"]))
+    building_checkpoint_path = st.sidebar.text_input(
+        "Checkpoint bâtiment",
+        value=building_checkpoint_default,
+        help=f"Checkpoint recommandé : {BUILDING_CHECKPOINT_LABEL}",
+    )
+    building_threshold = st.sidebar.slider(
+        "Seuil bâtiment",
+        min_value=0.10,
+        max_value=0.90,
+        value=0.60,
+        step=0.05,
+    )
+    if (
+        inference_mode == "Damage + TTA d4 + building component majority"
+        and not resolve_project_path(building_checkpoint_path).exists()
+    ):
+        st.sidebar.warning(
+            "Checkpoint bâtiment introuvable : le mode TTA d4 seul reste disponible."
+        )
+
+    render_model_summary(
+        device_name,
+        inference_mode,
+        building_checkpoint_path,
+        building_threshold,
+    )
 
     mode = st.sidebar.radio(
         "Mode",
@@ -571,9 +867,19 @@ def main() -> None:
     )
 
     if mode == "Dataset xBD":
-        render_dataset_mode(device_name, tta_mode)
+        render_dataset_mode(
+            device_name,
+            inference_mode,
+            building_checkpoint_path,
+            building_threshold,
+        )
     else:
-        render_upload_mode(device_name, tta_mode)
+        render_upload_mode(
+            device_name,
+            inference_mode,
+            building_checkpoint_path,
+            building_threshold,
+        )
 
 
 if __name__ == "__main__":
