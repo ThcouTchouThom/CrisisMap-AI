@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=19:00:00
-#SBATCH --output=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.out
-#SBATCH --error=/home/tgrjlt2/scratch/CrisisMap-AI/logs/%x-%j.err
+#SBATCH --output=/scratch/tgrjlt2/CrisisMap-AI/logs/%x-%j.out
+#SBATCH --error=/scratch/tgrjlt2/CrisisMap-AI/logs/%x-%j.err
 #SBATCH --mail-user=t.gourjault@gmail.com
 #SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT
 
@@ -25,7 +25,7 @@ module load cuda
 module load opencv/4.13.0
 
 source "${HOME}/virtualenvs/crisismap-ai/bin/activate"
-export TRITON_CACHE_DIR="${HOME}/scratch/CrisisMap-AI/triton_cache"
+export TRITON_CACHE_DIR="${SCRATCH}/CrisisMap-AI/triton_cache"
 mkdir -p "${TRITON_CACHE_DIR}" "${HOME}/scratch/CrisisMap-AI/run_logs"
 mkdir -p outputs/checkpoints outputs/predictions outputs/figures/building_long
 
