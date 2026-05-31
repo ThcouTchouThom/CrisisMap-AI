@@ -25,8 +25,12 @@ module load cuda
 module load opencv/4.13.0
 
 source "${HOME}/virtualenvs/crisismap-ai/bin/activate"
+: "${SCRATCH:?SCRATCH environment variable is required}"
 export TRITON_CACHE_DIR="${SCRATCH}/CrisisMap-AI/triton_cache"
-mkdir -p "${TRITON_CACHE_DIR}" "${HOME}/scratch/CrisisMap-AI/run_logs"
+mkdir -p \
+  "${TRITON_CACHE_DIR}" \
+  "${SCRATCH}/CrisisMap-AI/run_logs" \
+  "${SCRATCH}/CrisisMap-AI/logs"
 mkdir -p outputs/checkpoints outputs/predictions outputs/figures/building_long
 
 ROOT="data/raw/xbd/train"
@@ -55,7 +59,7 @@ LAST_CHECKPOINT="${OUTPUT_DIR}/last_building.pt"
 METRICS_JSON="outputs/predictions/${EXPERIMENT}_building_test_metrics.json"
 METRICS_CSV="outputs/predictions/${EXPERIMENT}_building_test_metrics.csv"
 EXAMPLES_DIR="outputs/figures/building_long/${EXPERIMENT}"
-RUN_LOG="${HOME}/scratch/CrisisMap-AI/run_logs/${EXPERIMENT}-${JOB_ID}.log"
+RUN_LOG="${SCRATCH}/CrisisMap-AI/run_logs/${EXPERIMENT}-${JOB_ID}.log"
 
 history_complete() {
   local history_json="$1"
