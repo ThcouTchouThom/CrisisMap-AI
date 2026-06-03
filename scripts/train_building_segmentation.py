@@ -32,9 +32,17 @@ MODEL_CHOICES = {
     "fpn_effb3",
 }
 INPUT_MODES = {"pre", "post", "pre-post"}
-LOSS_CHOICES = {"bce-dice", "dice-bce", "focal-dice", "focal-tversky"}
+LOSS_CHOICES = {
+    "bce-dice",
+    "dice-bce",
+    "focal-dice",
+    "focal-tversky",
+    "bce-dice-boundary",
+    "focal-tversky-boundary",
+}
 AUGMENT_MODES = {"none", "safe", "building-safe", "building-strong"}
 SAMPLER_MODES = {"none", "building-sqrt"}
+TRAIN_MODES = {"full1024", "crop512", "crop608"}
 
 
 class BuildingTrainingError(Exception):
@@ -49,10 +57,16 @@ class BuildingInputDataset(torch.utils.data.Dataset):
         base_dataset: torch.utils.data.Dataset,
         input_mode: str,
         augment_mode: str = "none",
+        crop_size: int | None = None,
+        rare_building_crop_prob: float = 0.75,
+        rare_building_crop_alpha: float | None = None,
     ) -> None:
         self.base_dataset = base_dataset
         self.input_mode = validate_input_mode(input_mode)
         self.augment_mode = validate_augment_mode(augment_mode)
+        self.crop_size = crop_size
+        self.rare_building_crop_prob = rare_building_crop_prob
+        self.rare_building_crop_alpha = rare_building_crop_alpha
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -70,13 +84,21 @@ class BuildingInputDataset(torch.utils.data.Dataset):
             raise BuildingTrainingError(f"Unsupported input mode: {self.input_mode}")
 
         target = sample["target"]
+        if self.crop_size is not None:
+            image, target = random_building_crop(
+                image,
+                target,
+                self.crop_size,
+                self.rare_building_crop_prob,
+                self.rare_building_crop_alpha,
+            )
         if self.augment_mode != "none":
             image, target = apply_building_augmentation(image, target, self.augment_mode)
 
         return {
             **sample,
-            "image": image,
-            "target": target,
+            "image": image.contiguous(),
+            "target": target.contiguous(),
         }
 
 
@@ -166,6 +188,49 @@ class FocalTverskyLoss(torch.nn.Module):
         return torch.pow(1.0 - tversky, self.gamma)
 
 
+class BoundaryLoss(torch.nn.Module):
+    """Differentiable boundary alignment loss for binary building masks."""
+
+    def __init__(self, kernel_size: int = 3, epsilon: float = 1e-6) -> None:
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        self.epsilon = epsilon
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probabilities = torch.sigmoid(logits)
+        pred_boundary = soft_boundary(probabilities, self.kernel_size, self.padding)
+        target_boundary = soft_boundary(targets, self.kernel_size, self.padding)
+        bce = F.binary_cross_entropy(pred_boundary.clamp(self.epsilon, 1.0 - self.epsilon), target_boundary)
+        intersection = torch.sum(pred_boundary * target_boundary)
+        denominator = torch.sum(pred_boundary) + torch.sum(target_boundary)
+        dice = 1.0 - (2.0 * intersection + self.epsilon) / (denominator + self.epsilon)
+        return bce + dice
+
+
+class BoundaryAwareLoss(torch.nn.Module):
+    """Base binary loss plus a lightweight boundary term."""
+
+    def __init__(self, base_loss: torch.nn.Module, boundary_weight: float) -> None:
+        super().__init__()
+        self.base_loss = base_loss
+        self.boundary_loss = BoundaryLoss()
+        self.boundary_weight = boundary_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return self.base_loss(logits, targets) + self.boundary_weight * self.boundary_loss(logits, targets)
+
+
+def soft_boundary(
+    mask: torch.Tensor,
+    kernel_size: int = 3,
+    padding: int = 1,
+) -> torch.Tensor:
+    dilated = F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=padding)
+    eroded = -F.max_pool2d(-mask, kernel_size=kernel_size, stride=1, padding=padding)
+    return (dilated - eroded).clamp(0.0, 1.0)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a binary building segmentation model on xBD/xView2.",
@@ -177,7 +242,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model", choices=sorted(MODEL_CHOICES), default="unetplusplus_effb3")
     parser.add_argument("--input-mode", choices=sorted(INPUT_MODES), default="pre")
+    parser.add_argument("--train-mode", choices=sorted(TRAIN_MODES), default="full1024")
     parser.add_argument("--image-size", type=int, default=1024)
+    parser.add_argument("--crop-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -209,6 +276,24 @@ def parse_args() -> argparse.Namespace:
         help="Alpha used by --sampler building-sqrt.",
     )
     parser.add_argument(
+        "--rare-building-crop-prob",
+        type=float,
+        default=0.75,
+        help="Probability of centering train crops on building pixels.",
+    )
+    parser.add_argument(
+        "--rare-building-crop-alpha",
+        type=float,
+        default=None,
+        help="Optional alpha converted to alpha/(1+alpha) for building-centered crops.",
+    )
+    parser.add_argument(
+        "--boundary-loss-weight",
+        type=float,
+        default=0.2,
+        help="Boundary loss weight for *-boundary loss modes.",
+    )
+    parser.add_argument(
         "--target-mode",
         choices=["building-binary"],
         default="building-binary",
@@ -237,6 +322,12 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in ["image_size", "batch_size", "epochs"]:
         if getattr(args, name) <= 0:
             raise BuildingTrainingError(f"--{name.replace('_', '-')} must be positive.")
+    if args.crop_size is not None and args.crop_size <= 0:
+        raise BuildingTrainingError("--crop-size must be positive when provided.")
+    if args.train_mode != "full1024":
+        crop_size = resolve_crop_size(args.train_mode, args.crop_size)
+        if crop_size >= args.image_size:
+            raise BuildingTrainingError("--crop-size must be smaller than --image-size.")
     if args.lr <= 0:
         raise BuildingTrainingError("--lr must be positive.")
     if args.num_workers < 0:
@@ -245,6 +336,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise BuildingTrainingError("--log-every must be non-negative.")
     if args.sampler_alpha < 0:
         raise BuildingTrainingError("--sampler-alpha must be non-negative.")
+    if not 0.0 <= args.rare_building_crop_prob <= 1.0:
+        raise BuildingTrainingError("--rare-building-crop-prob must be between 0 and 1.")
+    if args.rare_building_crop_alpha is not None and args.rare_building_crop_alpha < 0:
+        raise BuildingTrainingError("--rare-building-crop-alpha must be non-negative.")
+    if args.boundary_loss_weight < 0:
+        raise BuildingTrainingError("--boundary-loss-weight must be non-negative.")
     for name in ["max_train_samples", "max_val_samples", "max_test_samples"]:
         value = getattr(args, name)
         if value is not None and value <= 0:
@@ -281,6 +378,18 @@ def canonical_augment_mode(augment_mode: str) -> str:
     return "building-safe" if augment_mode == "safe" else augment_mode
 
 
+def resolve_crop_size(train_mode: str, crop_size: int | None) -> int | None:
+    if train_mode == "full1024":
+        return None
+    if crop_size is not None:
+        return crop_size
+    if train_mode == "crop512":
+        return 512
+    if train_mode == "crop608":
+        return 608
+    raise BuildingTrainingError(f"Unsupported train mode: {train_mode}")
+
+
 def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -308,6 +417,9 @@ def make_dataset(
     target_mode: str,
     max_samples: int | None,
     augment_mode: str,
+    crop_size: int | None = None,
+    rare_building_crop_prob: float = 0.75,
+    rare_building_crop_alpha: float | None = None,
 ) -> torch.utils.data.Dataset:
     base_dataset = XBDPairDataset(
         root=root,
@@ -319,7 +431,14 @@ def make_dataset(
     )
     if max_samples is not None:
         base_dataset = Subset(base_dataset, range(min(max_samples, len(base_dataset))))
-    return BuildingInputDataset(base_dataset, input_mode, augment_mode=augment_mode)
+    return BuildingInputDataset(
+        base_dataset,
+        input_mode,
+        augment_mode=augment_mode,
+        crop_size=crop_size,
+        rare_building_crop_prob=rare_building_crop_prob,
+        rare_building_crop_alpha=rare_building_crop_alpha,
+    )
 
 
 def make_loader(
@@ -400,6 +519,17 @@ def build_loss(args: argparse.Namespace) -> torch.nn.Module:
             beta=args.focal_tversky_beta,
             gamma=args.focal_tversky_gamma,
         )
+    if args.loss == "bce-dice-boundary":
+        return BoundaryAwareLoss(BCEDiceLoss(), args.boundary_loss_weight)
+    if args.loss == "focal-tversky-boundary":
+        return BoundaryAwareLoss(
+            FocalTverskyLoss(
+                alpha=args.focal_tversky_alpha,
+                beta=args.focal_tversky_beta,
+                gamma=args.focal_tversky_gamma,
+            ),
+            args.boundary_loss_weight,
+        )
     raise BuildingTrainingError(f"Unsupported loss: {args.loss}")
 
 
@@ -436,6 +566,32 @@ def apply_building_augmentation(
     image, target = apply_building_geometric_augmentation(image, target)
     image = apply_building_photometric_augmentation(image, augment_mode)
     return image.contiguous(), target.contiguous()
+
+
+def random_building_crop(
+    image: torch.Tensor,
+    target: torch.Tensor,
+    crop_size: int,
+    rare_building_crop_prob: float,
+    rare_building_crop_alpha: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _, height, width = image.shape
+    crop = int(crop_size)
+    if crop >= height or crop >= width:
+        return image, target
+    crop_probability = rare_building_crop_prob
+    if rare_building_crop_alpha is not None:
+        crop_probability = rare_building_crop_alpha / (1.0 + rare_building_crop_alpha)
+    building_pixels = (target > 0).nonzero(as_tuple=False)
+    if building_pixels.numel() and torch.rand(()) < crop_probability:
+        choice = building_pixels[torch.randint(0, building_pixels.shape[0], (1,)).item()]
+        center_y, center_x = int(choice[0]), int(choice[1])
+        top = min(max(center_y - crop // 2, 0), height - crop)
+        left = min(max(center_x - crop // 2, 0), width - crop)
+    else:
+        top = int(torch.randint(0, height - crop + 1, (1,)).item())
+        left = int(torch.randint(0, width - crop + 1, (1,)).item())
+    return image[:, top : top + crop, left : left + crop], target[top : top + crop, left : left + crop]
 
 
 def apply_building_geometric_augmentation(
@@ -686,6 +842,7 @@ def evaluate(
     total_loss = 0.0
     total_samples = 0
     counts = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
+    boundary_counts = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
@@ -699,19 +856,29 @@ def evaluate(
         probabilities = torch.sigmoid(logits).squeeze(1)
         predictions = probabilities >= 0.5
         target_bool = targets > 0
+        pred_boundary = soft_boundary(predictions.float().unsqueeze(1)) > 0
+        target_boundary = soft_boundary(target_float) > 0
 
         counts["tp"] += int(torch.count_nonzero(predictions & target_bool).item())
         counts["tn"] += int(torch.count_nonzero((~predictions) & (~target_bool)).item())
         counts["fp"] += int(torch.count_nonzero(predictions & (~target_bool)).item())
         counts["fn"] += int(torch.count_nonzero((~predictions) & target_bool).item())
+        boundary_counts["tp"] += int(torch.count_nonzero(pred_boundary & target_boundary).item())
+        boundary_counts["tn"] += int(torch.count_nonzero((~pred_boundary) & (~target_boundary)).item())
+        boundary_counts["fp"] += int(torch.count_nonzero(pred_boundary & (~target_boundary)).item())
+        boundary_counts["fn"] += int(torch.count_nonzero((~pred_boundary) & target_boundary).item())
 
         batch_size = images.shape[0]
         total_loss += float(loss.detach().item()) * batch_size
         total_samples += batch_size
 
     metrics = metrics_from_counts(counts)
+    boundary_metrics = metrics_from_counts(boundary_counts)
     metrics["loss"] = total_loss / max(total_samples, 1)
     metrics["confusion_counts"] = counts
+    metrics["boundary_f1"] = boundary_metrics["building_f1"]
+    metrics["boundary_precision"] = boundary_metrics["building_precision"]
+    metrics["boundary_recall"] = boundary_metrics["building_recall"]
     return metrics
 
 
@@ -830,6 +997,8 @@ def write_summary_csv(
         "model_requested",
         "model_actual",
         "input_mode",
+        "train_mode",
+        "crop_size",
         "image_size",
         "batch_size",
         "epochs",
@@ -838,10 +1007,15 @@ def write_summary_csv(
         "augment_mode",
         "sampler",
         "sampler_alpha",
+        "rare_building_crop_prob",
+        "rare_building_crop_alpha",
+        "boundary_loss_weight",
         "val_building_iou",
         "val_building_f1",
+        "val_boundary_f1",
         "test_building_iou",
         "test_building_f1",
+        "test_boundary_f1",
         "test_mean_iou",
     ]
     row = {
@@ -849,6 +1023,8 @@ def write_summary_csv(
         "model_requested": args.model,
         "model_actual": actual_model,
         "input_mode": args.input_mode,
+        "train_mode": args.train_mode,
+        "crop_size": resolve_crop_size(args.train_mode, args.crop_size),
         "image_size": args.image_size,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
@@ -857,10 +1033,15 @@ def write_summary_csv(
         "augment_mode": args.augment_mode,
         "sampler": args.sampler,
         "sampler_alpha": args.sampler_alpha,
+        "rare_building_crop_prob": args.rare_building_crop_prob,
+        "rare_building_crop_alpha": args.rare_building_crop_alpha,
+        "boundary_loss_weight": args.boundary_loss_weight,
         "val_building_iou": best_val_metrics.get("building_iou"),
         "val_building_f1": best_val_metrics.get("building_f1"),
+        "val_boundary_f1": best_val_metrics.get("boundary_f1"),
         "test_building_iou": None if test_metrics is None else test_metrics.get("building_iou"),
         "test_building_f1": None if test_metrics is None else test_metrics.get("building_f1"),
+        "test_boundary_f1": None if test_metrics is None else test_metrics.get("boundary_f1"),
         "test_mean_iou": None if test_metrics is None else test_metrics.get("mean_iou"),
     }
     with path.open("w", newline="", encoding="utf-8") as file:
@@ -898,6 +1079,7 @@ def train(args: argparse.Namespace) -> None:
     output_dir = prepare_output_dir(args.output_dir)
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == "cuda")
+    crop_size = resolve_crop_size(args.train_mode, args.crop_size)
 
     train_dataset = make_dataset(
         args.root,
@@ -907,6 +1089,9 @@ def train(args: argparse.Namespace) -> None:
         args.target_mode,
         args.max_train_samples,
         augment_mode=args.augment_mode,
+        crop_size=crop_size,
+        rare_building_crop_prob=args.rare_building_crop_prob,
+        rare_building_crop_alpha=args.rare_building_crop_alpha,
     )
     val_dataset = make_dataset(
         args.root,
@@ -978,6 +1163,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Model actual: {actual_model}")
     print(f"Input mode: {args.input_mode}")
     print(f"Target mode: {args.target_mode}")
+    print(f"Train mode: {args.train_mode}")
+    print(f"Crop size: {crop_size}")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
     print(f"Parameters: {parameter_count(model):,}")
@@ -985,6 +1172,9 @@ def train(args: argparse.Namespace) -> None:
     print(f"Augment mode: {args.augment_mode}")
     print(f"Sampler: {args.sampler}")
     print(f"Sampler alpha: {args.sampler_alpha}")
+    print(f"Rare building crop prob: {args.rare_building_crop_prob}")
+    print(f"Rare building crop alpha: {args.rare_building_crop_alpha}")
+    print(f"Boundary loss weight: {args.boundary_loss_weight}")
     print(f"Drop last train batch: {args.drop_last_train}")
     print(f"Log every: {args.log_every} batches")
     if args.resume_checkpoint is not None:
@@ -1017,6 +1207,7 @@ def train(args: argparse.Namespace) -> None:
             "val_building_precision": val_metrics["building_precision"],
             "val_building_recall": val_metrics["building_recall"],
             "val_building_f1": val_metrics["building_f1"],
+            "val_boundary_f1": val_metrics.get("boundary_f1"),
             "epoch_seconds": time.time() - epoch_start,
         }
         history.append(epoch_metrics)
