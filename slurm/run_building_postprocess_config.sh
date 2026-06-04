@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=02:00:00
-#SBATCH --output=${SCRATCH}/CrisisMap-AI/logs/%x-%j.out
-#SBATCH --error=${SCRATCH}/CrisisMap-AI/logs/%x-%j.err
+#SBATCH --output=/scratch/tgrjlt2/CrisisMap-AI/logs/%x-%j.out
+#SBATCH --error=/scratch/tgrjlt2/CrisisMap-AI/logs/%x-%j.err
 # Email notifications to avoid frequent scheduler polling
 #SBATCH --mail-user=t.gourjault@gmail.com
 #SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT

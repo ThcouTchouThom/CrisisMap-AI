@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=mtf_v2
+#SBATCH --job-name=mtf_damage
 #SBATCH --account=def-zonata_gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=8
@@ -21,7 +21,6 @@ required_env() {
   fi
 }
 
-required_env ENABLED
 required_env EXPERIMENT
 required_env MODEL
 required_env TARGET_MODE
@@ -32,7 +31,6 @@ required_env CROP_SIZE
 required_env TRAIN_CSV
 required_env VAL_CSV
 required_env TEST_CSV
-required_env LOSS
 required_env LR
 required_env WEIGHT_DECAY
 required_env BATCH_SIZE
@@ -40,12 +38,6 @@ required_env EPOCHS
 required_env NUM_WORKERS
 required_env AUGMENT
 required_env RARE_DAMAGE_CROP_PROB
-required_env RARE_DAMAGE_CROP_ALPHA
-
-if [[ "${ENABLED}" != "1" && "${ENABLED}" != "true" && "${ENABLED}" != "TRUE" ]]; then
-  echo "Experiment ${EXPERIMENT} is disabled/planned in the config; skipping."
-  exit 0
-fi
 
 if [[ -z "${SCRATCH:-}" ]]; then
   echo "ERROR: SCRATCH is not set. This runner expects Rorqual scratch paths." >&2
@@ -77,51 +69,8 @@ module load opencv/4.13.0
 
 source "${VENV_PATH}"
 
-if [[ "${TARGET_MODE}" == "5-class" || "${LABEL_MODE}" == "5-class" ]]; then
-  echo "Running automatic 5-class label audit before enabling ${EXPERIMENT}."
-  python - "${DATA_ROOT}" "${TRAIN_CSV}" "${VAL_CSV}" "${TEST_CSV}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-import pandas as pd
-
-root = Path(sys.argv[1])
-csv_paths = [Path(value) for value in sys.argv[2:]]
-observed = set()
-
-for csv_path in csv_paths:
-    df = pd.read_csv(csv_path)
-    if "target_value_counts" in df.columns:
-        for value in df["target_value_counts"].dropna():
-            try:
-                counts = json.loads(str(value))
-            except json.JSONDecodeError:
-                continue
-            observed.update(int(float(key)) for key in counts.keys())
-        continue
-
-    from crisismap.data.xbd_dataset import load_target_mask, resolve_data_path
-
-    if "target" not in df.columns:
-        raise SystemExit(f"{csv_path} has no target column for 5-class audit.")
-    for _, row in df.iterrows():
-        mask = load_target_mask(resolve_data_path(root, row["target"]), image_size=1024)
-        observed.update(int(v) for v in pd.unique(mask.reshape(-1)))
-
-required = {2, 3, 4}
-if not required.issubset(observed):
-    raise SystemExit(
-        "5-class audit failed: expected separate minor/major/destroyed labels "
-        f"{sorted(required)}, observed labels {sorted(observed)}. "
-        "Keep this row disabled/planned until original 5-class labels are available."
-    )
-print(f"5-class label audit OK. Observed labels: {sorted(observed)}")
-PY
-fi
-
 CHECKPOINT_DIR="outputs/checkpoints/${EXPERIMENT}"
-PRED_DIR="outputs/predictions/multitemporal_fusion_v2"
+PRED_DIR="outputs/predictions/multitemporal_fusion"
 METRICS_JSON="${PRED_DIR}/${EXPERIMENT}_test_metrics.json"
 METRICS_CSV="${PRED_DIR}/${EXPERIMENT}_test_metrics.csv"
 HISTORY_JSON="${CHECKPOINT_DIR}/metrics_history.json"
@@ -151,8 +100,6 @@ echo "Model: ${MODEL}"
 echo "Target mode: ${TARGET_MODE}"
 echo "Label mode: ${LABEL_MODE}"
 echo "Train mode: ${TRAIN_MODE}"
-echo "Loss: ${LOSS}"
-echo "Rare crop alpha: ${RARE_DAMAGE_CROP_ALPHA}"
 echo "Checkpoint dir: ${CHECKPOINT_DIR}"
 echo "History epochs: ${EPOCH_COUNT}/${EPOCHS}"
 echo "Best checkpoint exists: $([[ -f "${BEST_CHECKPOINT}" ]] && echo yes || echo no)"
@@ -184,12 +131,6 @@ if [[ "${EPOCH_COUNT}" -ge "${EPOCHS}" && -f "${BEST_CHECKPOINT}" && ! -f "${MET
   exit 0
 fi
 
-if [[ "${EPOCH_COUNT}" -ge "${EPOCHS}" && ! -f "${BEST_CHECKPOINT}" && "${FORCE}" != "1" && "${FORCE_INCOMPLETE}" != "1" ]]; then
-  echo "ERROR: History has expected epochs but best checkpoint is missing." >&2
-  echo "Use FORCE_INCOMPLETE=1 only to retrain this experiment from scratch." >&2
-  exit 2
-fi
-
 if [[ "${FORCE}" == "1" || "${FORCE_INCOMPLETE}" == "1" ]]; then
   echo "Action: force_train_fresh"
   rm -rf "${CHECKPOINT_DIR}"
@@ -199,12 +140,11 @@ fi
 
 TRAIN_EXTRA_ARGS=()
 if [[ "${EPOCH_COUNT}" -gt 0 ]]; then
-  if [[ "${EPOCH_COUNT}" -lt "${EPOCHS}" && "${RESUME_INCOMPLETE}" == "1" && -f "${LAST_CHECKPOINT}" ]]; then
+  if [[ "${RESUME_INCOMPLETE}" == "1" && -f "${LAST_CHECKPOINT}" ]]; then
     echo "Action: resume from ${LAST_CHECKPOINT}"
     TRAIN_EXTRA_ARGS+=(--resume-checkpoint "${LAST_CHECKPOINT}")
   else
-    echo "ERROR: Incomplete checkpoint folder exists." >&2
-    echo "Use RESUME_INCOMPLETE=1 with a last checkpoint or FORCE_INCOMPLETE=1 to retrain." >&2
+    echo "ERROR: Incomplete run exists. Use RESUME_INCOMPLETE=1 or FORCE_INCOMPLETE=1." >&2
     exit 2
   fi
 else
@@ -214,9 +154,6 @@ fi
 TRAIN_ARGS=()
 if [[ "${AUGMENT}" == "1" || "${AUGMENT}" == "true" || "${AUGMENT}" == "TRUE" ]]; then
   TRAIN_ARGS+=(--augment)
-fi
-if [[ "${RARE_DAMAGE_CROP_ALPHA}" != "none" && -n "${RARE_DAMAGE_CROP_ALPHA}" ]]; then
-  TRAIN_ARGS+=(--rare-damage-crop-alpha "${RARE_DAMAGE_CROP_ALPHA}")
 fi
 
 python -u scripts/train_multitemporal_fusion.py \
@@ -231,7 +168,6 @@ python -u scripts/train_multitemporal_fusion.py \
   --image-size "${IMAGE_SIZE}" \
   --crop-size "${CROP_SIZE}" \
   --rare-damage-crop-prob "${RARE_DAMAGE_CROP_PROB}" \
-  --loss "${LOSS}" \
   --batch-size "${BATCH_SIZE}" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
