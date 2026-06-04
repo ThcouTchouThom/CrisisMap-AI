@@ -26,6 +26,7 @@ export TRITON_CACHE_DIR="${SCRATCH}/CrisisMap-AI/triton_cache"
 mkdir -p "${TRITON_CACHE_DIR}" "${SCRATCH}/CrisisMap-AI/logs" "${SCRATCH}/CrisisMap-AI/run_logs"
 
 cd "${CODE_DIR}"
+export PYTHONPATH="${CODE_DIR}/src:${CODE_DIR}:${PYTHONPATH:-}"
 
 module load StdEnv/2023
 module load python/3.11

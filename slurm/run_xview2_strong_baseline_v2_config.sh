@@ -66,6 +66,7 @@ SLURM_LOG_DIR="${SCRATCH}/CrisisMap-AI/logs"
 mkdir -p "${TRITON_CACHE_DIR}" "${RUN_LOG_DIR}" "${SLURM_LOG_DIR}"
 
 cd "${CODE_DIR}"
+export PYTHONPATH="${CODE_DIR}/src:${CODE_DIR}:${PYTHONPATH:-}"
 
 module load StdEnv/2023
 module load python/3.11

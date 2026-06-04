@@ -15,6 +15,7 @@
 
 set -euo pipefail
 cd "${HOME}/work/CrisisMap-AI"
+export PYTHONPATH="${PWD}/src:${PWD}:${PYTHONPATH:-}"
 
 module --force purge
 module load StdEnv/2023

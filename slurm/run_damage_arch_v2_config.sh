@@ -16,6 +16,7 @@
 
 set -euo pipefail
 cd "${HOME}/work/CrisisMap-AI"
+export PYTHONPATH="${PWD}/src:${PWD}:${PYTHONPATH:-}"
 
 export CONFIG_CSV="${CONFIG_CSV:-configs/damage_arch_sweep_v2.csv}"
 bash slurm/run_damage_arch_config.sh
