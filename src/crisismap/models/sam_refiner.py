@@ -1,3 +1,5 @@
+"""Post-processing refinement using SAM2."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -6,7 +8,27 @@ from scipy import ndimage
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
+
 class SAMRefiner:
+    """Raffine les masques U-Net avec SAM2.
+
+    SAM2 utilise l'image pre-catastrophe pour delimiter precisement
+    la forme des batiments, puis fusionne avec les classes U-Net.
+
+    Parameters
+    ----------
+    checkpoint:
+        Chemin vers le fichier .pt de SAM2.
+    model_type:
+        Config SAM2 yaml.
+    device:
+        Device torch.
+    building_classes:
+        Classes considerees comme batiments. 3-class: {1, 2}.
+    min_component_pixels:
+        Composantes connexes plus petites ignorees.
+    """
+
     def __init__(
         self,
         checkpoint: str,
@@ -20,45 +42,58 @@ class SAMRefiner:
         )
         self.building_classes = building_classes or {1, 2}
         self.min_component_pixels = min_component_pixels
+
         sam2_model = build_sam2(model_type, checkpoint, device=self.device)
         self.predictor = SAM2ImagePredictor(sam2_model)
 
     def refine_batch(
         self,
-        pre_images: torch.Tensor,
-        unet_preds: torch.Tensor,
-    ) -> torch.Tensor:
-        refined = []
-        for img, pred in zip(pre_images, unet_preds):
-            refined.append(self._refine_single(img, pred))
-        return torch.stack(refined)
+        reference_images: torch.Tensor,   # (B, 3, H, W) image pre-catastrophe
+        unet_preds: torch.Tensor,          # (B, H, W) masque U-Net
+    ) -> tuple[torch.Tensor, torch.Tensor, list[list[np.ndarray]]]:
+        """Retourne (masques raffines, masques SAM binaires, bounding boxes par image)."""
+        refined_list = []
+        sam_binary_list = []
+        all_boxes = []
+        for img, pred in zip(reference_images, unet_preds):
+            refined, sam_binary, boxes = self._refine_single(img, pred)
+            refined_list.append(refined)
+            sam_binary_list.append(sam_binary)
+            all_boxes.append(boxes)
+        return torch.stack(refined_list), torch.stack(sam_binary_list), all_boxes
 
     def _refine_single(
         self,
-        pre_image: torch.Tensor,
-        unet_pred: torch.Tensor,
-    ) -> torch.Tensor:
-        img_np = self._to_rgb_numpy(pre_image)
+        reference_image: torch.Tensor,   # (3, H, W) image pre-catastrophe
+        unet_pred: torch.Tensor,          # (H, W) masque U-Net
+    ) -> tuple[torch.Tensor, torch.Tensor, list[np.ndarray]]:
+        img_np = self._to_rgb_numpy(reference_image)
         pred_np = unet_pred.cpu().numpy()
         building_mask = np.isin(pred_np, list(self.building_classes))
 
         boxes = self._extract_boxes(building_mask)
         if len(boxes) == 0:
-            return unet_pred.clone()
+            empty_sam = torch.zeros_like(unet_pred, dtype=torch.uint8)
+            return unet_pred.clone(), empty_sam, []
 
         with torch.inference_mode():
             self.predictor.set_image(img_np)
             sam_masks = self._predict_masks(boxes)
 
-        return self._merge(pred_np, building_mask, sam_masks)
+        refined = self._merge(pred_np, building_mask, sam_masks)
+        # Masque SAM binaire brut : union de tous les masques SAM (1 = batiment selon SAM)
+        sam_binary = torch.from_numpy(sam_masks.any(axis=0).astype(np.uint8))
+        return refined, sam_binary, boxes
 
     def _to_rgb_numpy(self, tensor: torch.Tensor) -> np.ndarray:
+        """(3, H, W) float [0,1] -> (H, W, 3) uint8."""
         img = tensor.cpu()
         if img.is_floating_point():
             img = (img.clamp(0, 1) * 255).byte()
         return img.permute(1, 2, 0).numpy()
 
     def _extract_boxes(self, binary_mask: np.ndarray) -> list[np.ndarray]:
+        """Retourne les bboxes [x1, y1, x2, y2] des composantes connexes."""
         labeled, n = ndimage.label(binary_mask)
         boxes = []
         for label_id in range(1, n + 1):
@@ -77,6 +112,7 @@ class SAMRefiner:
         return boxes
 
     def _predict_masks(self, boxes: list[np.ndarray]) -> np.ndarray:
+        """Appelle SAM2 sur toutes les boxes. Retourne (N, H, W) bool."""
         boxes_np = np.stack(boxes)
         masks, _, _ = self.predictor.predict(
             point_coords=None,
@@ -90,15 +126,21 @@ class SAMRefiner:
 
     def _merge(
         self,
-        pred_np: np.ndarray,
-        building_mask: np.ndarray,
-        sam_masks: np.ndarray,
+        pred_np: np.ndarray,        # (H, W) masque U-Net
+        building_mask: np.ndarray,  # (H, W) bool — pixels batiments U-Net
+        sam_masks: np.ndarray,      # (N, H, W) bool — masques SAM
     ) -> torch.Tensor:
-        refined = pred_np.copy()
-        sam_union = sam_masks.any(axis=0)
+        """Fusion : SAM definit la forme, U-Net definit la classe pixel par pixel.
 
-        # Faux positifs U-Net -> background
-        refined[building_mask & ~sam_union] = 0
+        - Pixels dans SAM ET dans U-Net batiment -> classe U-Net preservee
+        - Pixels dans SAM mais pas dans U-Net batiment -> background (SAM hors zone U-Net)
+        - Pixels hors SAM -> background (faux positifs U-Net supprimes)
+        """
+        refined = np.zeros_like(pred_np)  # tout background par defaut
+        sam_union = sam_masks.any(axis=0)  # (H, W) union de tous les masques SAM
 
-        # Pixels dans les deux -> classe U-Net préservée
+        # Seuls les pixels confirmes par SAM ET classes comme batiment par U-Net sont gardes
+        overlap = sam_union & building_mask
+        refined[overlap] = pred_np[overlap]
+
         return torch.from_numpy(refined)
