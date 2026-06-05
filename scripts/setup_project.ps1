@@ -8,15 +8,22 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $ProjectRoot
 
-$ArchiveDir = Join-Path $ProjectRoot "data\raw\archives"
-$XbdRoot = Join-Path $ProjectRoot "data\raw\xbd"
-$TrainRoot = Join-Path $XbdRoot "train"
-$GeotransformsRoot = Join-Path $ProjectRoot "data\raw\geotransforms"
-$ProcessedDir = Join-Path $ProjectRoot "data\processed"
-$SplitsDir = Join-Path $ProcessedDir "splits"
-$CheckpointsDir = Join-Path $ProjectRoot "outputs\checkpoints"
+# Ajustement du chemin de l'environnement virtuel selon l'OS
 $VenvDir = Join-Path $ProjectRoot ".venv"
-$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+if ($IsLinux -or $IsMacOS) {
+    $VenvPython = Join-Path $VenvDir "bin/python"
+} else {
+    $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+}
+
+# Utilisation de Join-Path partout pour éviter les slashes codés en dur
+$ArchiveDir = Join-Path $ProjectRoot (Join-Path "data" (Join-Path "raw" "archives"))
+$XbdRoot = Join-Path $ProjectRoot (Join-Path "data" (Join-Path "raw" "xbd"))
+$TrainRoot = Join-Path $XbdRoot "train"
+$GeotransformsRoot = Join-Path $ProjectRoot (Join-Path "data" (Join-Path "raw" "geotransforms"))
+$ProcessedDir = Join-Path $ProjectRoot (Join-Path "data" "processed")
+$SplitsDir = Join-Path $ProcessedDir "splits"
+$CheckpointsDir = Join-Path $ProjectRoot (Join-Path "outputs" "checkpoints")
 
 $TrainArchive = Join-Path $ArchiveDir "train_images_labels_targets.tar"
 $GeotransformsArchive = Join-Path $ArchiveDir "xview_geotransforms.json.tgz"
@@ -95,18 +102,22 @@ function Ensure-PythonVenv {
     }
 
     $Created = $false
-    $PythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    # Commande par défaut sous Linux : python3, sous Windows : python
+    $PythonExeName = if ($IsLinux -or $IsMacOS) { "python3" } else { "python" }
+    $PythonCommand = Get-Command $PythonExeName -ErrorAction SilentlyContinue
+    
     if ($null -ne $PythonCommand) {
         try {
             Invoke-Native "Create Python virtual environment" $PythonCommand.Source @("-m", "venv", $VenvDir)
             $Created = $true
         }
         catch {
-            Write-Warning "Could not create virtual environment with 'python': $($_.Exception.Message)"
+            Write-Warning "Could not create virtual environment with '$PythonExeName': $($_.Exception.Message)"
         }
     }
 
-    if (-not $Created -and -not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+    # Sécurité Windows (py launcher) si la commande standard a échoué
+    if (-not $Created -and $IsWindows -and -not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
         $PyLauncher = Get-Command py -ErrorAction SilentlyContinue
         if ($null -eq $PyLauncher) {
             throw "Python 3 was not found. Install Python 3, then rerun this script."
@@ -159,8 +170,8 @@ Ensure-Directory $SplitsDir
 Ensure-Directory $CheckpointsDir
 
 Write-Step "Check required local archives"
-Require-File $TrainArchive "Place train_images_labels_targets.tar in data\raw\archives."
-Require-File $GeotransformsArchive "Place xview_geotransforms.json.tgz in data\raw\archives."
+Require-File $TrainArchive "Place train_images_labels_targets.tar in data/raw/archives."
+Require-File $GeotransformsArchive "Place xview_geotransforms.json.tgz in data/raw/archives."
 
 Ensure-PythonVenv
 Invoke-Native "Upgrade pip" $VenvPython @("-m", "pip", "install", "--upgrade", "pip")
@@ -169,7 +180,7 @@ Invoke-Native "Install Python dependencies" $VenvPython @("-m", "pip", "install"
 
 $TarCommand = Get-Command tar -ErrorAction SilentlyContinue
 if ($null -eq $TarCommand) {
-    throw "The 'tar' command was not found. Install a Windows tar tool or use a PowerShell version that includes tar."
+    throw "The 'tar' command was not found. Please install tar on your system."
 }
 
 if ($Force -or -not (Test-DatasetFolders)) {
@@ -201,11 +212,14 @@ foreach ($Folder in $ExpectedDatasetFolders) {
 }
 Require-File $GeotransformsJson "The geotransforms archive should extract xview_geotransforms.json."
 
-Invoke-Native "Inspect xBD dataset" $VenvPython @("src\crisismap\data\inspect_xbd.py", "--root", $TrainRoot)
+# Utilisation de chemins relatifs propres à l'OS pour les scripts Python
+$InspectScript = Join-Path "src" (Join-Path "crisismap" (Join-Path "data" "inspect_xbd.py"))
+Invoke-Native "Inspect xBD dataset" $VenvPython @($InspectScript, "--root", $TrainRoot)
 
+$BuildIndexScript = Join-Path "src" (Join-Path "crisismap" (Join-Path "data" "build_xbd_index.py"))
 if ($Force -or -not (Test-Path -LiteralPath $IndexCsv -PathType Leaf)) {
     Invoke-Native "Build xBD index CSV" $VenvPython @(
-        "src\crisismap\data\build_xbd_index.py",
+        $BuildIndexScript,
         "--root", $TrainRoot,
         "--output", $IndexCsv
     )
@@ -214,14 +228,16 @@ else {
     Write-Host "Index already exists; skipping index rebuild: $IndexCsv"
 }
 
+$SummarizeScript = Join-Path "src" (Join-Path "crisismap" (Join-Path "data" "summarize_xbd_index.py"))
 Invoke-Native "Summarize xBD index" $VenvPython @(
-    "src\crisismap\data\summarize_xbd_index.py",
+    $SummarizeScript,
     "--index", $IndexCsv
 )
 
+$CreateSplitsScript = Join-Path "src" (Join-Path "crisismap" (Join-Path "data" "create_xbd_splits.py"))
 if ($Force -or -not (Test-SplitFiles)) {
     $SplitArgs = @(
-        "src\crisismap\data\create_xbd_splits.py",
+        $CreateSplitsScript,
         "--index", $IndexCsv,
         "--output-dir", $SplitsDir,
         "--disasters"
@@ -241,10 +257,24 @@ Write-Host "Split CSVs: $SplitsDir"
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  Train a baseline model:"
-Write-Host "    .\.venv\Scripts\python.exe src\crisismap\training\train_unet.py --root data\raw\xbd\train --train-csv data\processed\splits\train_pairs.csv --val-csv data\processed\splits\val_pairs.csv --output-dir outputs\checkpoints\unet_baseline_512_v2_30epochs --image-size 512 --batch-size 2 --epochs 30 --target-mode 3-class"
-Write-Host ""
-Write-Host "  Run the Streamlit app:"
-Write-Host "    .\.venv\Scripts\streamlit.exe run app\streamlit_app.py"
+
+# Formatage de l'aide finale selon l'OS courant
+if ($IsLinux -or $IsMacOS) {
+    Write-Host "    $VenvPython src/crisismap/training/train_unet.py --root data/raw/xbd/train --train-csv data/processed/splits/train_pairs.csv --val-csv data/processed/splits/val_pairs.csv --output-dir outputs/checkpoints/unet_baseline_512_v2_30epochs --image-size 512 --batch-size 2 --epochs 30 --target-mode 3-class"
+    Write-Host ""
+    Write-Host "  Run the Streamlit app:"
+    $StreamlitBin = Join-Path $VenvDir "bin/streamlit"
+    Write-Host "    $StreamlitBin run app/streamlit_app.py"
+} else {
+    Write-Host "    .\.venv\Scripts\python.exe src\crisismap\training\train_unet.py --root data\raw\xbd\train --train-csv data\processed\splits\train_pairs.csv --val-csv data\processed\splits\val_pairs.csv --output-dir outputs\checkpoints\unet_baseline_512_v2_30epochs --image-size 512 --batch-size 2 --epochs 30 --target-mode 3-class"
+    Write-Host ""
+    Write-Host "  Run the Streamlit app:"
+    Write-Host "    .\.venv\Scripts\streamlit.exe run app\streamlit_app.py"
+}
 Write-Host ""
 Write-Host "  If you received a checkpoint, place it here:"
-Write-Host "    outputs\checkpoints\unet_baseline_512_v2_30epochs\best_unet.pt"
+if ($IsLinux -or $IsMacOS) {
+    Write-Host "    outputs/checkpoints/unet_baseline_512_v2_30epochs/best_unet.pt"
+} else {
+    Write-Host "    outputs\checkpoints\unet_baseline_512_v2_30epochs\best_unet.pt"
+}
