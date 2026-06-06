@@ -261,14 +261,14 @@ def load_sample(split_name: str, pair_id: str) -> dict[str, object]:
 
 
 @torch.no_grad()
-def predict(
+def predict_with_details(
     model: UNet,
     image: torch.Tensor,
     device_name: str,
     inference_mode: str,
     building_checkpoint_path: str,
     building_threshold: float,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor | None]:
     device = torch.device(device_name)
     options = INFERENCE_MODE_OPTIONS[inference_mode]
     tta_mode = str(options["damage_tta"])
@@ -280,7 +280,13 @@ def predict(
     )
     raw_prediction = torch.argmax(logits, dim=1)
     if not bool(options["use_building"]):
-        return raw_prediction.squeeze(0).cpu()
+        raw_cpu = raw_prediction.squeeze(0).cpu()
+        return {
+            "prediction": raw_cpu,
+            "raw_damage": raw_cpu,
+            "building_mask": None,
+            "post_processed_damage": None,
+        }
 
     building_model = load_building_model(
         building_checkpoint_path,
@@ -298,7 +304,37 @@ def predict(
         connectivity=BUILDING_COMPONENT_CONNECTIVITY,
         device=device,
     )
-    return post_processed.squeeze(0).cpu()
+    return {
+        "prediction": post_processed.squeeze(0).cpu(),
+        "raw_damage": raw_prediction.squeeze(0).cpu(),
+        "building_mask": building_mask.squeeze(0).cpu(),
+        "post_processed_damage": post_processed.squeeze(0).cpu(),
+    }
+
+
+@torch.no_grad()
+def predict(
+    model: UNet,
+    image: torch.Tensor,
+    device_name: str,
+    inference_mode: str,
+    building_checkpoint_path: str,
+    building_threshold: float,
+) -> torch.Tensor:
+    """Return only the final prediction for legacy call sites."""
+
+    details = predict_with_details(
+        model,
+        image,
+        device_name,
+        inference_mode,
+        building_checkpoint_path,
+        building_threshold,
+    )
+    prediction = details["prediction"]
+    if prediction is None:
+        raise AppError("Aucune prédiction finale n'a été produite.")
+    return prediction
 
 
 def tta_ops(tta_mode: str) -> list[tuple[int, bool, bool]]:
@@ -482,10 +518,23 @@ def tensor_to_rgb(tensor: torch.Tensor) -> np.ndarray:
     return (array * 255).astype(np.uint8)
 
 
+def tensor_to_optional_numpy(tensor: torch.Tensor | None) -> np.ndarray | None:
+    if tensor is None:
+        return None
+    return tensor.detach().cpu().numpy()
+
+
 def colorize_mask(mask: np.ndarray) -> np.ndarray:
     color_image = np.zeros((*mask.shape, 3), dtype=np.uint8)
     for class_id, color in CLASS_COLORS.items():
         color_image[mask == class_id] = color
+    return color_image
+
+
+def colorize_building_mask(mask: np.ndarray) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    color_image = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    color_image[mask] = CLASS_COLORS[1]
     return color_image
 
 
@@ -581,6 +630,9 @@ def render_prediction_outputs(
     title: str,
     inference_mode: str,
     target: np.ndarray | None = None,
+    raw_damage: np.ndarray | None = None,
+    building_mask: np.ndarray | None = None,
+    post_processed_damage: np.ndarray | None = None,
 ) -> None:
     predicted_mask = colorize_mask(prediction)
     prediction_overlay = overlay_prediction(post_image, prediction)
@@ -604,6 +656,15 @@ def render_prediction_outputs(
 
     if target is None:
         st.info("Aucune vérité terrain fournie — inférence uniquement.")
+
+    if bool(INFERENCE_MODE_OPTIONS[inference_mode]["use_building"]):
+        render_visual_explainability(
+            post_image=post_image,
+            raw_damage=raw_damage,
+            building_mask=building_mask,
+            post_processed_damage=post_processed_damage,
+            final_overlay=prediction_overlay,
+        )
 
     st.markdown("## Détails de l'inférence")
     detail_cols = st.columns(3)
@@ -639,6 +700,53 @@ def render_prediction_outputs(
             metric_cols[3].metric("Pixel accuracy", f"{metrics['pixel_accuracy']:.3f}")
             metric_cols[4].metric("Mean IoU", f"{metrics['mean_iou']:.3f}")
             metric_cols[5].metric("IoU damaged", f"{metrics['iou_damaged']:.3f}")
+
+
+def render_visual_explainability(
+    post_image: np.ndarray,
+    raw_damage: np.ndarray | None,
+    building_mask: np.ndarray | None,
+    post_processed_damage: np.ndarray | None,
+    final_overlay: np.ndarray,
+) -> None:
+    st.markdown("## Explicabilité visuelle")
+    st.caption(
+        "Le mode bêta montre les masques intermédiaires utilisés pour passer "
+        "de la prédiction damage brute à la carte finale post-traitée."
+    )
+
+    if raw_damage is None or building_mask is None or post_processed_damage is None:
+        st.info("Les masques intermédiaires ne sont pas disponibles pour cette inférence.")
+        return
+
+    cols = st.columns(4)
+    cols[0].image(
+        post_image,
+        caption="1. Image post-catastrophe",
+        width="stretch",
+    )
+    cols[1].image(
+        colorize_mask(raw_damage),
+        caption="2. Damage brut / TTA d4",
+        width="stretch",
+    )
+    cols[2].image(
+        colorize_building_mask(building_mask),
+        caption="3. Masque bâtiment prédit",
+        width="stretch",
+    )
+    cols[3].image(
+        colorize_mask(post_processed_damage),
+        caption="4. Damage après component majority",
+        width="stretch",
+    )
+
+    with st.expander("Overlay final sur l'image post-catastrophe", expanded=True):
+        st.image(
+            final_overlay,
+            caption="5. Overlay final : damage post-processé sur image après catastrophe",
+            width="stretch",
+        )
 
 
 def render_dataset_mode(
@@ -695,7 +803,7 @@ def render_dataset_mode(
     try:
         sample = load_sample(split_name, pair_id)
         model = load_model(str(CHECKPOINT_PATH), device_name)
-        prediction = predict(
+        inference_details = predict_with_details(
             model,
             sample["image"],
             device_name,
@@ -719,6 +827,9 @@ def render_dataset_mode(
 
     image_tensor = sample["image"]
     target = sample["target"].detach().cpu().numpy()
+    prediction = inference_details["prediction"]
+    if prediction is None:
+        raise AppError("Aucune prédiction finale n'a été produite.")
     pred = prediction.numpy()
     pre_image = tensor_to_rgb(image_tensor[:3])
     post_image = tensor_to_rgb(image_tensor[3:6])
@@ -730,6 +841,11 @@ def render_dataset_mode(
         target=target,
         inference_mode=inference_mode,
         title=f"Paire sélectionnée : `{pair_id}`",
+        raw_damage=tensor_to_optional_numpy(inference_details["raw_damage"]),
+        building_mask=tensor_to_optional_numpy(inference_details["building_mask"]),
+        post_processed_damage=tensor_to_optional_numpy(
+            inference_details["post_processed_damage"]
+        ),
     )
 
     with st.expander("Détails de l'échantillon"):
@@ -778,7 +894,7 @@ def render_upload_mode(
             IMAGE_SIZE,
         )
         model = load_model(str(CHECKPOINT_PATH), device_name)
-        prediction = predict(
+        inference_details = predict_with_details(
             model,
             image_tensor,
             device_name,
@@ -799,6 +915,9 @@ def render_upload_mode(
             st.info(f"Checkpoint bâtiment attendu : `{building_checkpoint_path}`")
         st.stop()
 
+    prediction = inference_details["prediction"]
+    if prediction is None:
+        raise AppError("Aucune prédiction finale n'a été produite.")
     render_prediction_outputs(
         pre_image=pre_image,
         post_image=post_image,
@@ -806,6 +925,11 @@ def render_upload_mode(
         target=None,
         inference_mode=inference_mode,
         title="Résultat d'inférence sur images téléversées",
+        raw_damage=tensor_to_optional_numpy(inference_details["raw_damage"]),
+        building_mask=tensor_to_optional_numpy(inference_details["building_mask"]),
+        post_processed_damage=tensor_to_optional_numpy(
+            inference_details["post_processed_damage"]
+        ),
     )
 
 
