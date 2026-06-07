@@ -35,7 +35,7 @@ if str(SRC_DIR) not in sys.path:
 if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-from crisismap.data.dataset import XBDDatasetError, XBDPairDataset
+from crisismap.data.xbd_dataset import XBDDatasetError, XBDPairDataset
 from crisismap.evaluation.evaluate_unet import (
     CLASS_LABELS,
     confusion_matrix,
