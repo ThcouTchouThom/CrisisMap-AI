@@ -43,7 +43,11 @@ from crisismap.evaluation.evaluate_unet import (
     load_checkpoint_file,
     metrics_from_confusion,
 )
-from crisismap.models.unet import UNet
+from crisismap.models.damage_model_factory import (
+    DamageModelFactoryError,
+    create_damage_model,
+    supported_damage_model_names,
+)
 from train_building_segmentation import (
     MODEL_CHOICES as BUILDING_MODEL_CHOICES,
     BuildingTrainingError,
@@ -82,8 +86,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--split-csv", required=True, type=Path)
     parser.add_argument("--image-size", type=int, default=1024)
-    parser.add_argument("--target-mode", default="3-class")
-    parser.add_argument("--damage-model", default="unet", choices=["unet"])
+    parser.add_argument("--target-mode", default="3-class", choices=sorted(CLASS_LABELS))
+    parser.add_argument(
+        "--damage-model",
+        default="unet",
+        choices=sorted(set(supported_damage_model_names() + ["unet"])),
+        help="Damage architecture used by --damage-checkpoint.",
+    )
     parser.add_argument("--damage-base-channels", type=int, default=32)
     parser.add_argument("--damage-tta", default="d4", choices=sorted(TTA_MODES))
     parser.add_argument(
@@ -147,18 +156,58 @@ def expand_per_checkpoint(values: list[str], n: int, label: str) -> list[str]:
     return values
 
 
-def load_damage_model(checkpoint_path: Path, base_channels: int, device: torch.device) -> nn.Module:
+def checkpoint_model_hint(checkpoint: object) -> str | None:
+    if not isinstance(checkpoint, dict):
+        return None
+    for key in ("model_name", "actual_model", "model"):
+        value = checkpoint.get(key)
+        if isinstance(value, str) and value:
+            return value
+    config = checkpoint.get("config")
+    if isinstance(config, dict):
+        for key in ("model", "model_name", "actual_model"):
+            value = config.get(key)
+            if isinstance(value, str) and value:
+                return value
+    metadata = checkpoint.get("model_metadata")
+    if isinstance(metadata, dict):
+        for key in ("requested_model", "canonical_model"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def load_damage_model(
+    checkpoint_path: Path,
+    model_name: str,
+    target_mode: str,
+    base_channels: int,
+    device: torch.device,
+) -> nn.Module:
     checkpoint = load_checkpoint_file(checkpoint_path, device)
     state_dict = extract_state_dict(checkpoint)
-    num_classes = len(CLASS_LABELS)
+    num_classes = len(CLASS_LABELS[target_mode])
     try:
-        model = UNet(in_channels=6, num_classes=num_classes, base_channels=base_channels).to(device)
-    except TypeError:
-        try:
-            model = UNet(in_channels=6, out_channels=num_classes, base_channels=base_channels).to(device)
-        except TypeError:
-            model = UNet(n_channels=6, n_classes=num_classes, base_channels=base_channels).to(device)
-    model.load_state_dict(state_dict)
+        model = create_damage_model(
+            model_name,
+            num_classes=num_classes,
+            in_channels=6,
+            base_channels=base_channels,
+        ).to(device)
+    except DamageModelFactoryError as exc:
+        raise RuntimeError(str(exc)) from exc
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        hint = checkpoint_model_hint(checkpoint)
+        hint_text = f" Checkpoint metadata suggests model '{hint}'." if hint else ""
+        raise RuntimeError(
+            "Damage checkpoint weights do not match the requested architecture. "
+            f"Requested --damage-model='{model_name}', --target-mode='{target_mode}', "
+            f"--damage-base-channels={base_channels}, checkpoint='{checkpoint_path}'."
+            f"{hint_text}"
+        ) from exc
     model.eval()
     return model
 
@@ -475,11 +524,22 @@ def main() -> None:
     )
 
     print(f"Device: {device}")
+    print(f"Damage model: {args.damage_model}")
+    print(f"Damage checkpoint: {args.damage_checkpoint}")
     print(f"Damage TTA: {args.damage_tta}")
     print(f"Building TTA: {args.building_tta}")
     print(f"Building checkpoints: {n_building}")
 
-    damage_model = load_damage_model(args.damage_checkpoint, args.damage_base_channels, device)
+    try:
+        damage_model = load_damage_model(
+            args.damage_checkpoint,
+            args.damage_model,
+            args.target_mode,
+            args.damage_base_channels,
+            device,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     building_nets = [
         load_building_model(path, model_name, input_mode, device)
         for path, model_name, input_mode in zip(

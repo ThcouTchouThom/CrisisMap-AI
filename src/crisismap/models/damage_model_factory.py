@@ -60,6 +60,16 @@ SUPPORTED_DAMAGE_MODELS: dict[str, DamageModelSpec] = {
         family="siamese",
         description="Siamese U-Net with channel attention after fusion.",
     ),
+    "siamese_unet_attention_base48": DamageModelSpec(
+        name="siamese_unet_attention_base48",
+        family="siamese",
+        description="Siamese attention U-Net with base_channels=48.",
+    ),
+    "siamese_unet_attention_base64": DamageModelSpec(
+        name="siamese_unet_attention_base64",
+        family="siamese",
+        description="Siamese attention U-Net with base_channels=64.",
+    ),
     "siamese_unet_base48": DamageModelSpec(
         name="siamese_unet_base48",
         family="siamese",
@@ -192,6 +202,20 @@ def create_damage_model(
             in_channels=in_channels,
             num_classes=num_classes,
             base_channels=base_channels,
+        )
+
+    if canonical_name == "siamese_unet_attention_base48":
+        return SiameseUNetAttention(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=48,
+        )
+
+    if canonical_name == "siamese_unet_attention_base64":
+        return SiameseUNetAttention(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=64,
         )
 
     if canonical_name == "siamese_unet_base48":

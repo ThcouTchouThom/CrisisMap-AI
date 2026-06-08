@@ -35,6 +35,7 @@ required_env BATCH_SIZE
 required_env NUM_WORKERS
 
 FORCE="${FORCE:-0}"
+DAMAGE_MODEL="${DAMAGE_MODEL:-unet}"
 CODE_DIR="${CODE_DIR:-${HOME}/work/CrisisMap-AI}"
 VENV_PATH="${VENV_PATH:-${HOME}/virtualenvs/crisismap-ai/bin/activate}"
 DATA_ROOT="${DATA_ROOT:-data/raw/xbd/train}"
@@ -93,6 +94,7 @@ fi
 echo "Experiment: ${EXPERIMENT}"
 echo "Task: ${TASK}"
 echo "Split: ${SPLIT_CSV}"
+echo "Damage model: ${DAMAGE_MODEL}"
 echo "Building models: ${BUILDING_MODELS}"
 echo "Building checkpoints: ${BUILDING_CHECKPOINTS}"
 echo "Building TTA: ${BUILDING_TTA}"
@@ -135,7 +137,7 @@ elif [[ "${TASK}" == "downstream" ]]; then
     --split-csv "${SPLIT_CSV}" \
     --image-size "${IMAGE_SIZE}" \
     --target-mode 3-class \
-    --damage-model unet \
+    --damage-model "${DAMAGE_MODEL}" \
     --damage-tta "${DAMAGE_TTA}" \
     --building-checkpoint "${BUILDING_CHECKPOINT_ARGS[@]}" \
     --building-model "${BUILDING_MODEL_ARGS[@]}" \

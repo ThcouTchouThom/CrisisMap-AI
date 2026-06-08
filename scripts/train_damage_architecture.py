@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -106,6 +107,12 @@ def parse_args() -> argparse.Namespace:
         help="Drop the final incomplete train batch; val loaders are unchanged.",
     )
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed for repeatability experiments.",
+    )
     return parser.parse_args()
 
 
@@ -156,6 +163,15 @@ def resolve_device(device_arg: str | None) -> torch.device:
             raise TrainingError("CUDA device was requested, but CUDA is not available.")
         return device
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def set_random_seed(seed: int | None) -> None:
+    if seed is None:
+        return
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def make_loader(
@@ -394,6 +410,7 @@ def save_arch_checkpoint(
 
 def train(args: argparse.Namespace) -> None:
     validate_args(args)
+    set_random_seed(args.seed)
     output_dir = prepare_output_dir(args.output_dir)
     device = resolve_device(args.device)
     use_amp = bool(args.amp and device.type == "cuda")
