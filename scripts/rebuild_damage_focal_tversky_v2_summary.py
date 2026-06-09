@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -196,6 +197,24 @@ def sort_key(row: dict[str, Any]) -> tuple[float, float, float]:
     )
 
 
+def finite_metric(row: dict[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def has_ranking_metrics(row: dict[str, Any]) -> bool:
+    return all(
+        finite_metric(row, key) is not None
+        for key in ("f1_damaged", "iou_damaged", "mean_iou")
+    )
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -223,14 +242,15 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
             f"mean IoU={ref['mean_iou']:.6f}"
         )
     print()
+    rows_with_metrics = [row for row in rows if has_ranking_metrics(row)]
+    print(f"Total rows: {len(rows)}")
+    print(f"Runs with metrics: {len(rows_with_metrics)}")
+    print(f"Runs without metrics: {len(rows) - len(rows_with_metrics)}")
+    print()
     print("Top runs by F1 damaged, IoU damaged, mean IoU:")
-    ranked = sorted(
-        [row for row in rows if row.get("status") == "complete"],
-        key=sort_key,
-        reverse=True,
-    )
+    ranked = sorted(rows_with_metrics, key=sort_key, reverse=True)
     if not ranked:
-        print("No complete runs with metrics yet.")
+        print("No runs with numeric f1_damaged, iou_damaged, and mean_iou yet.")
         return
     for index, row in enumerate(ranked[:20], start=1):
         print(
