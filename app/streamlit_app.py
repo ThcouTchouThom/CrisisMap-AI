@@ -77,14 +77,30 @@ SPLIT_DIR_CANDIDATES = [
 ]
 TARGET_MODE = "3-class"
 
+
+def first_existing_path(paths: list[Path]) -> Path:
+    """Retourne le premier chemin existant, sinon le premier candidat."""
+    return next((path for path in paths if path.exists()), paths[0])
+
+
+DAMAGE_CHAMPION_CHECKPOINT_CANDIDATES = [
+    PROJECT_ROOT
+    / "outputs"
+    / "checkpoints"
+    / "dftv2_hist1000_attention_sqrt2_ft_250_seed0"
+    / "best_damage_arch_portable.pt",
+    PROJECT_ROOT
+    / "outputs"
+    / "checkpoints"
+    / "dftv2_hist1000_attention_sqrt2_ft_250_seed0"
+    / "best_damage_arch.pt",
+]
+
 DAMAGE_MODELS: dict[str, dict[str, Any]] = {
     "damage_champion_v2": {
         "label": "Damage champion v2 - Siamese Attention",
-        "checkpoint": PROJECT_ROOT
-        / "outputs"
-        / "checkpoints"
-        / "dftv2_hist1000_attention_sqrt2_ft_250_seed0"
-        / "best_damage_arch.pt",
+        "checkpoint": first_existing_path(DAMAGE_CHAMPION_CHECKPOINT_CANDIDATES),
+        "checkpoint_candidates": DAMAGE_CHAMPION_CHECKPOINT_CANDIDATES,
         "model_name": "siamese_unet_attention",
         "description": (
             "Meilleur modèle damage actuel : Siamese Attention, focal-Tversky, "
@@ -126,17 +142,14 @@ DAMAGE_MODELS: dict[str, dict[str, Any]] = {
 }
 
 BUILDING_CHECKPOINT_CANDIDATES = [
-    PROJECT_ROOT / "outputs" / "checkpoints" / "b400_effb4_sampler8_ft" / "best_building.pt",
     PROJECT_ROOT
     / "outputs"
     / "checkpoints"
     / "b400_effb4_sampler8_ft"
     / "best_building_portable.pt",
+    PROJECT_ROOT / "outputs" / "checkpoints" / "b400_effb4_sampler8_ft" / "best_building.pt",
 ]
-BUILDING_CHECKPOINT = next(
-    (path for path in BUILDING_CHECKPOINT_CANDIDATES if path.exists()),
-    BUILDING_CHECKPOINT_CANDIDATES[0],
-)
+BUILDING_CHECKPOINT = first_existing_path(BUILDING_CHECKPOINT_CANDIDATES)
 BUILDING_MODEL_NAME = "unetplusplus_effb4"
 BUILDING_INPUT_MODE = "pre"
 BUILDING_SUMMARY = "Building b400 : F1 building = 0.8504, IoU building = 0.7398"
@@ -402,7 +415,7 @@ html, body, .stApp {{
     font-family: 'Syne', sans-serif;
     font-weight: 700;
 }}
-#MainMenu, footer, header {{
+#MainMenu, footer {{
     visibility: hidden !important;
 }}
 </style>
@@ -887,7 +900,7 @@ def render_class_chart(pred: np.ndarray) -> None:
         xaxis=dict(showgrid=False),
         showlegend=False,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_comparison_slider(
@@ -957,7 +970,7 @@ def render_download(
         mask_buffer.getvalue(),
         file_name=f"mask_{pair_id}_{datetime.now():%H%M%S}.png",
         mime="image/png",
-        use_container_width=True,
+        width="stretch",
     )
 
     overlay_buffer = io.BytesIO()
@@ -967,7 +980,7 @@ def render_download(
         overlay_buffer.getvalue(),
         file_name=f"overlay_{pair_id}_{datetime.now():%H%M%S}.png",
         mime="image/png",
-        use_container_width=True,
+        width="stretch",
     )
 
     report = {
@@ -982,7 +995,7 @@ def render_download(
         json.dumps(report, indent=2, ensure_ascii=False),
         file_name=f"report_{pair_id}_{datetime.now():%H%M%S}.json",
         mime="application/json",
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -1056,20 +1069,20 @@ def render_results(record: dict[str, Any], use_building: bool) -> None:
 
         render_section("Explicabilité visuelle")
         row1 = st.columns(3)
-        row1[0].image(pre, caption="Image avant catastrophe", use_container_width=True)
-        row1[1].image(post, caption="Image après catastrophe", use_container_width=True)
-        row1[2].image(colorize(raw_pred), caption="Damage brut / TTA d4", use_container_width=True)
+        row1[0].image(pre, caption="Image avant catastrophe", width="stretch")
+        row1[1].image(post, caption="Image après catastrophe", width="stretch")
+        row1[2].image(colorize(raw_pred), caption="Damage brut / TTA d4", width="stretch")
 
         row2 = st.columns(3)
         if building_mask is not None:
-            row2[0].image(colorize_building(building_mask), caption="Masque bâtiment prédit", use_container_width=True)
+            row2[0].image(colorize_building(building_mask), caption="Masque bâtiment prédit", width="stretch")
         else:
-            row2[0].image(np.zeros_like(post), caption="Masque bâtiment non utilisé", use_container_width=True)
-        row2[1].image(colorize(final_pred), caption="Damage final post-processé", use_container_width=True)
+            row2[0].image(np.zeros_like(post), caption="Masque bâtiment non utilisé", width="stretch")
+        row2[1].image(colorize(final_pred), caption="Damage final post-processé", width="stretch")
         if target is not None:
-            row2[2].image(colorize(target), caption="Vérité terrain", use_container_width=True)
+            row2[2].image(colorize(target), caption="Vérité terrain", width="stretch")
         else:
-            row2[2].image(overlay_final, caption="Overlay final", use_container_width=True)
+            row2[2].image(overlay_final, caption="Overlay final", width="stretch")
 
     with tabs[1]:
         if metrics is not None:
@@ -1092,7 +1105,7 @@ def render_results(record: dict[str, Any], use_building: bool) -> None:
         if building_probs is not None:
             render_section("Probabilité bâtiment")
             st.caption(f"Pixels bâtiment retenus : {int(building_mask.sum()) if building_mask is not None else 0:,}")
-            st.image((np.clip(building_probs, 0, 1) * 255).astype(np.uint8), use_container_width=True)
+            st.image((np.clip(building_probs, 0, 1) * 255).astype(np.uint8), width="stretch")
 
     with tabs[2]:
         render_section("Carte d'entropie")
@@ -1106,7 +1119,7 @@ hésite entre bâtiment intact et bâtiment endommagé.
 """,
             unsafe_allow_html=True,
         )
-        st.image(entropy_map(probs), caption="Entropie normalisée", use_container_width=True)
+        st.image(entropy_map(probs), caption="Entropie normalisée", width="stretch")
 
         render_section("Probabilités par classe")
         prob_cols = st.columns(3)
@@ -1114,7 +1127,7 @@ hésite entre bâtiment intact et bâtiment endommagé.
             prob_cols[class_id].image(
                 (probs[:, :, class_id] * 255).astype(np.uint8),
                 caption=label,
-                use_container_width=True,
+                width="stretch",
             )
 
     with tabs[3]:
@@ -1149,6 +1162,7 @@ def render_sidebar() -> dict[str, Any]:
         st.sidebar.success("Checkpoint damage disponible.")
     else:
         st.sidebar.error(f"Checkpoint damage manquant : {rel_path(model_cfg['checkpoint'])}")
+    st.sidebar.caption(f"Checkpoint utilisé : {rel_path(model_cfg['checkpoint'])}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cuda_available = device == "cuda"
@@ -1267,7 +1281,7 @@ def render_dataset_mode(cfg: dict[str, Any]) -> None:
 
     col_select, col_button = st.columns([4, 1])
     pair_id = col_select.selectbox("Paire xBD", pair_ids, label_visibility="collapsed")
-    analyze = col_button.button("Analyser", type="primary", use_container_width=True)
+    analyze = col_button.button("Analyser", type="primary", width="stretch")
 
     cache_key = (
         "dataset",
@@ -1345,7 +1359,7 @@ def render_upload_mode(cfg: dict[str, Any]) -> None:
             label_visibility="collapsed",
         )
         if pre_file:
-            st.image(read_upload(pre_file, int(cfg["model_cfg"]["image_size"])), caption="Aperçu - Avant", use_container_width=True)
+            st.image(read_upload(pre_file, int(cfg["model_cfg"]["image_size"])), caption="Aperçu - Avant", width="stretch")
 
     with right:
         st.markdown("**Image après catastrophe**")
@@ -1356,7 +1370,7 @@ def render_upload_mode(cfg: dict[str, Any]) -> None:
             label_visibility="collapsed",
         )
         if post_file:
-            st.image(read_upload(post_file, int(cfg["model_cfg"]["image_size"])), caption="Aperçu - Après", use_container_width=True)
+            st.image(read_upload(post_file, int(cfg["model_cfg"]["image_size"])), caption="Aperçu - Après", width="stretch")
 
     both_ready = pre_file is not None and post_file is not None
     if not both_ready:
@@ -1366,7 +1380,7 @@ def render_upload_mode(cfg: dict[str, Any]) -> None:
         "Lancer l'inférence" if both_ready else "En attente des deux images",
         type="primary",
         disabled=not both_ready,
-        use_container_width=True,
+        width="stretch",
     )
 
     upload_key = None
