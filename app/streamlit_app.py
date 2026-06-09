@@ -1,119 +1,198 @@
-"""Streamlit alpha prototype for Aftermath damage-map inference."""
+"""Aftermath - prototype Streamlit de démonstration Jalon 5."""
 
 from __future__ import annotations
 
+import base64
+import io
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import torch
 from PIL import Image, ImageOps
 
+RESAMPLE_BILINEAR = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# == Chemins du projet =========================================================
+
+
+def find_project_root(start: Path) -> Path:
+    """Trouve la racine du dépôt en cherchant src/ et scripts/."""
+    for candidate in (start, *start.parents):
+        if (candidate / "src").is_dir() and (candidate / "scripts").is_dir():
+            return candidate
+    return start
+
+
+PROJECT_ROOT = find_project_root(Path(__file__).resolve().parent)
 PROJECT_SRC = PROJECT_ROOT / "src"
 PROJECT_SCRIPTS = PROJECT_ROOT / "scripts"
-if str(PROJECT_SRC) not in sys.path:
-    sys.path.insert(0, str(PROJECT_SRC))
-if str(PROJECT_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(PROJECT_SCRIPTS))
 
-from crisismap.data.xbd_dataset import (  # noqa: E402
-    XBDDatasetError,
-    XBDPairDataset as XBDDataset,
+for path in (PROJECT_SRC, PROJECT_SCRIPTS):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from crisismap.data.xbd_dataset import XBDDatasetError, XBDPairDataset as XBDDataset  # noqa: E402
+from crisismap.models.damage_model_factory import (  # noqa: E402
+    DamageModelFactoryError,
+    create_damage_model,
 )
-from crisismap.models.unet import UNet  # noqa: E402
-from train_building_segmentation import (  # noqa: E402
-    BuildingTrainingError,
-    build_model as build_building_model,
-    clean_state_dict as clean_building_state_dict,
-    input_channels as building_input_channels,
-    normalize_logits as normalize_building_logits,
-)
+
+try:
+    from train_building_segmentation import (  # noqa: E402
+        BuildingTrainingError,
+        build_model as build_building_model,
+        clean_state_dict as clean_building_state_dict,
+        input_channels as building_input_channels,
+        normalize_logits as normalize_building_logits,
+    )
+
+    BUILDING_MODULE_AVAILABLE = True
+except ImportError:
+    BUILDING_MODULE_AVAILABLE = False
+    BuildingTrainingError = Exception
+
+try:
+    import plotly.graph_objects as go
+
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+
+# == Constantes ================================================================
 
 
 DATA_ROOT = PROJECT_ROOT / "data" / "raw" / "xbd" / "train"
-SPLITS_DIR = PROJECT_ROOT / "data" / "processed" / "splits"
-CHECKPOINT_PATH = (
-    PROJECT_ROOT
-    / "outputs"
-    / "checkpoints"
-    / "unet_1024_long250_noleak_match_hist_all_aug-safe_sampler-damage-sqrt-alpha4_250epochs"
-    / "best_unet_portable.pt"
-)
-BUILDING_CHECKPOINT_PATH = (
-    PROJECT_ROOT
-    / "outputs"
-    / "checkpoints"
-    / "b100_d_full_pre_unetplusplus_effb4_sampler8_focal_tversky"
-    / "best_building_portable.pt"
-)
-
-IMAGE_SIZE = 1024
+SPLIT_DIR_CANDIDATES = [
+    PROJECT_ROOT / "data" / "processed" / "splits",
+    PROJECT_ROOT / "data" / "processed" / "splits_full",
+]
 TARGET_MODE = "3-class"
-BASE_CHANNELS = 32
+
+DAMAGE_MODELS: dict[str, dict[str, Any]] = {
+    "damage_champion_v2": {
+        "label": "Damage champion v2 - Siamese Attention",
+        "checkpoint": PROJECT_ROOT
+        / "outputs"
+        / "checkpoints"
+        / "dftv2_hist1000_attention_sqrt2_ft_250_seed0"
+        / "best_damage_arch.pt",
+        "model_name": "siamese_unet_attention",
+        "description": (
+            "Meilleur modèle damage actuel : Siamese Attention, focal-Tversky, "
+            "hist1000, sampler sqrt2, 250 epochs."
+        ),
+        "in_channels": 6,
+        "base_channels": 32,
+        "image_size": 1024,
+        "summary": "F1 damaged = 0.7013, IoU damaged = 0.5400, mean IoU = 0.7283",
+    },
+    "unet_long250": {
+        "label": "U-Net long250 - baseline forte",
+        "checkpoint": PROJECT_ROOT
+        / "outputs"
+        / "checkpoints"
+        / "unet_1024_long250_noleak_match_hist_all_aug-safe_sampler-damage-sqrt-alpha4_250epochs"
+        / "best_unet_portable.pt",
+        "model_name": "unet",
+        "description": "Baseline U-Net forte, 1024 px, no-leak, 250 epochs.",
+        "in_channels": 6,
+        "base_channels": 32,
+        "image_size": 1024,
+        "summary": "Avec TTA d4 : F1 damaged = 0.6313, IoU damaged = 0.4612",
+    },
+    "unet_baseline": {
+        "label": "U-Net baseline",
+        "checkpoint": PROJECT_ROOT
+        / "outputs"
+        / "checkpoints"
+        / "unet_baseline"
+        / "best_unet_portable.pt",
+        "model_name": "unet",
+        "description": "Ancien U-Net de référence, utile seulement comme fallback.",
+        "in_channels": 6,
+        "base_channels": 32,
+        "image_size": 512,
+        "summary": "Fallback rapide si les checkpoints 1024 ne sont pas disponibles.",
+    },
+}
+
+BUILDING_CHECKPOINT_CANDIDATES = [
+    PROJECT_ROOT / "outputs" / "checkpoints" / "b400_effb4_sampler8_ft" / "best_building.pt",
+    PROJECT_ROOT
+    / "outputs"
+    / "checkpoints"
+    / "b400_effb4_sampler8_ft"
+    / "best_building_portable.pt",
+]
+BUILDING_CHECKPOINT = next(
+    (path for path in BUILDING_CHECKPOINT_CANDIDATES if path.exists()),
+    BUILDING_CHECKPOINT_CANDIDATES[0],
+)
 BUILDING_MODEL_NAME = "unetplusplus_effb4"
 BUILDING_INPUT_MODE = "pre"
-BUILDING_COMPONENT_CONNECTIVITY = 8
-CHECKPOINT_LABEL = (
-    "unet_1024_long250_noleak_match_hist_all_aug-safe_sampler-damage-sqrt-alpha4_250epochs/"
-    "best_unet_portable.pt"
-)
-BUILDING_CHECKPOINT_LABEL = (
-    "b100_d_full_pre_unetplusplus_effb4_sampler8_focal_tversky/"
-    "best_building_portable.pt"
-)
-INFERENCE_MODE_OPTIONS = {
-    "Damage only": {
+BUILDING_SUMMARY = "Building b400 : F1 building = 0.8504, IoU building = 0.7398"
+
+PIPELINES: dict[str, dict[str, Any]] = {
+    "damage_only": {
+        "label": "Rapide : damage seul",
         "damage_tta": "none",
         "use_building": False,
-        "description": "U-Net sans TTA, pour les demos rapides.",
+        "description": "Inférence damage brute, la plus rapide.",
     },
-    "Damage + TTA d4": {
+    "damage_tta": {
+        "label": "Qualité : damage + TTA d4",
         "damage_tta": "d4",
         "use_building": False,
-        "description": "Pipeline damage officiel avec TTA d4.",
+        "description": "Moyenne D4 sur le modèle damage, plus stable mais plus lente.",
     },
-    "Damage + TTA d4 + building component majority": {
+    "damage_tta_building": {
+        "label": "Qualité maximale : damage + TTA d4 + building post-process",
         "damage_tta": "d4",
         "use_building": True,
-        "description": "Pipeline downstream actuel avec masque batiment predit.",
+        "description": "Pipeline recommandé : TTA damage, masque bâtiment, component majority.",
     },
 }
 
-RECOMMENDED_PAIR_IDS_BY_SPLIT = {
-    "train": [
-        "hurricane-harvey_00000000",
-        "hurricane-michael_00000034",
-        "santa-rosa-wildfire_00000035",
-        "palu-tsunami_00000042",
-    ],
-    "val": [
-        "hurricane-harvey_00000137",
-        "hurricane-harvey_00000347",
-        "santa-rosa-wildfire_00000129",
-    ],
-    "test": [
-        "hurricane-harvey_00000358",
-        "hurricane-harvey_00000132",
-        "santa-rosa-wildfire_00000093",
-        "palu-tsunami_00000109",
-        "hurricane-michael_00000120",
-    ],
+SOURCE_MODES = {
+    "upload": "Téléverser des images",
+    "dataset": "Exemples du dataset",
 }
-JALON3_DEMO_PAIR_IDS = [
+
+THEME_LABELS = ["Sombre", "Clair", "Système"]
+
+RECOMMENDED_PAIR_IDS = [
     "hurricane-florence_00000070",
     "hurricane-florence_00000217",
     "hurricane-florence_00000153",
+    "hurricane-harvey_00000358",
+    "santa-rosa-wildfire_00000093",
+    "palu-tsunami_00000109",
 ]
 
-CLASS_LABELS = {
-    0: "Fond / absence de bâtiment",
-    1: "Bâtiment non endommagé",
-    2: "Bâtiment endommagé",
+DISASTER_INFO: dict[str, tuple[str, str]] = {
+    "hurricane-harvey": ("Houston, TX", "#3b82f6"),
+    "hurricane-michael": ("Panama City, FL", "#3b82f6"),
+    "hurricane-florence": ("Wilmington, NC", "#3b82f6"),
+    "santa-rosa-wildfire": ("Santa Rosa, CA", "#f97316"),
+    "socal-fire": ("Los Angeles, CA", "#f97316"),
+    "woolsey-fire": ("Malibu, CA", "#f97316"),
+    "palu-tsunami": ("Palu, Indonésie", "#06b6d4"),
+    "sunda-tsunami": ("Indonésie", "#06b6d4"),
+    "midwest-flooding": ("Iowa, USA", "#6366f1"),
+    "joplin-tornado": ("Joplin, MO", "#a855f7"),
+    "guatemala-volcano": ("Guatemala", "#ef4444"),
+    "mexico-earthquake": ("Mexico City", "#d97706"),
 }
+
 CLASS_COLORS = {
     0: np.array([0, 0, 0], dtype=np.uint8),
     1: np.array([0, 170, 80], dtype=np.uint8),
@@ -121,889 +200,1265 @@ CLASS_COLORS = {
 }
 
 
+# == Style =====================================================================
+
+
+def theme_colors(theme: str) -> dict[str, str]:
+    dark = theme == "Sombre"
+    if dark:
+        return {
+            "bg": "#0a0d12",
+            "surface": "#111620",
+            "surface2": "#181e2a",
+            "border": "#222c3c",
+            "text_hi": "#eaf0fb",
+            "text_md": "#93a4bb",
+            "text_lo": "#69778b",
+            "accent": "#dc2828",
+        }
+    return {
+        "bg": "#f4f6fa",
+        "surface": "#ffffff",
+        "surface2": "#eef2f7",
+        "border": "#d1dae9",
+        "text_hi": "#0f172a",
+        "text_md": "#475569",
+        "text_lo": "#94a3b8",
+        "accent": "#dc2828",
+    }
+
+
+def build_css(theme: str) -> str:
+    colors = theme_colors("Sombre" if theme == "Sombre" else "Clair")
+    return f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+html, body, .stApp {{
+    font-family: 'Inter', sans-serif !important;
+    background-color: {colors["bg"]} !important;
+    color: {colors["text_hi"]} !important;
+}}
+[data-testid="stSidebar"] {{
+    background-color: {colors["surface"]} !important;
+    border-right: 1px solid {colors["border"]} !important;
+}}
+.stButton > button {{
+    background: {colors["accent"]} !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 7px !important;
+    font-weight: 600 !important;
+}}
+.stDownloadButton > button {{
+    background: {colors["surface2"]} !important;
+    color: {colors["text_hi"]} !important;
+    border: 1px solid {colors["border"]} !important;
+    border-radius: 7px !important;
+}}
+.stTabs [data-baseweb="tab-list"] {{
+    border-bottom: 1px solid {colors["border"]} !important;
+}}
+.stTabs [data-baseweb="tab"] {{
+    font-size: 0.86rem !important;
+    color: {colors["text_md"]} !important;
+}}
+.stTabs [aria-selected="true"] {{
+    color: {colors["accent"]} !important;
+    border-bottom: 2px solid {colors["accent"]} !important;
+}}
+.amr-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    border-bottom: 1px solid {colors["border"]};
+    padding: 1.1rem 0 1rem;
+    margin-bottom: 1.4rem;
+}}
+.amr-logo {{
+    font-family: 'Syne', sans-serif;
+    font-size: 1.85rem;
+    font-weight: 700;
+    color: {colors["accent"]};
+    letter-spacing: -0.02em;
+}}
+.amr-tagline {{
+    color: {colors["text_lo"]};
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}}
+.amr-badges {{
+    display: flex;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}}
+.amr-badge {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.67rem;
+    color: {colors["text_md"]};
+    border: 1px solid {colors["border"]};
+    background: {colors["surface"]};
+    padding: 0.22rem 0.58rem;
+    border-radius: 999px;
+}}
+.amr-badge.accent {{
+    color: {colors["accent"]};
+    border-color: {colors["accent"]};
+}}
+.section-lbl {{
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    margin: 1.2rem 0 0.65rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.66rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: {colors["text_lo"]};
+}}
+.section-lbl::after {{
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: {colors["border"]};
+}}
+.legend-bar {{
+    display: flex;
+    gap: 1.25rem;
+    flex-wrap: wrap;
+    padding: 0.7rem 1rem;
+    background: {colors["surface"]};
+    border: 1px solid {colors["border"]};
+    border-radius: 8px;
+    margin-bottom: 1rem;
+}}
+.leg-item {{
+    display: flex;
+    align-items: center;
+    gap: 0.42rem;
+    color: {colors["text_md"]};
+    font-size: 0.84rem;
+}}
+.leg-dot {{
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+}}
+.metric-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+    gap: 0.7rem;
+    margin: 0.5rem 0 1rem;
+}}
+.mcard {{
+    border: 1px solid {colors["border"]};
+    background: {colors["surface"]};
+    border-radius: 8px;
+    padding: 0.85rem 0.9rem;
+    text-align: center;
+}}
+.mval {{
+    font-family: 'Syne', sans-serif;
+    color: {colors["text_hi"]};
+    font-size: 1.35rem;
+    font-weight: 700;
+}}
+.mlbl {{
+    color: {colors["text_lo"]};
+    font-size: 0.65rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}}
+.info-strip {{
+    border-left: 3px solid {colors["accent"]};
+    background: rgba(220, 40, 40, 0.08);
+    border-radius: 0 8px 8px 0;
+    padding: 0.65rem 0.9rem;
+    margin: 0.5rem 0 1rem;
+    color: {colors["text_md"]};
+}}
+.history-row {{
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    border: 1px solid {colors["border"]};
+    background: {colors["surface"]};
+    border-radius: 8px;
+    padding: 0.7rem 0.9rem;
+    margin-bottom: 0.45rem;
+}}
+.hr-id {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.76rem;
+}}
+.hr-meta {{
+    color: {colors["text_lo"]};
+    font-size: 0.72rem;
+}}
+.hr-dmg {{
+    color: {colors["accent"]};
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+}}
+#MainMenu, footer, header {{
+    visibility: hidden !important;
+}}
+</style>
+"""
+
+
+# == Utilitaires ===============================================================
+
+
 class AppError(Exception):
-    """Raised when the Streamlit prototype cannot continue safely."""
+    """Erreur applicative affichable dans Streamlit."""
 
 
-@st.cache_data(show_spinner=False)
-def load_split(split_name: str) -> pd.DataFrame:
-    split_csv = SPLITS_DIR / f"{split_name}_pairs.csv"
-    if not split_csv.exists():
-        raise AppError(f"Split CSV introuvable : {split_csv}")
-    if not split_csv.is_file():
-        raise AppError(f"Le chemin du split n'est pas un fichier : {split_csv}")
-
+def rel_path(path: Path) -> str:
     try:
-        df = pd.read_csv(split_csv)
-    except OSError as exc:
-        raise AppError(f"Impossible de lire le split '{split_csv}' : {exc}") from exc
-    except pd.errors.EmptyDataError as exc:
-        raise AppError(f"Le split est vide : {split_csv}") from exc
-    except pd.errors.ParserError as exc:
-        raise AppError(f"Impossible de parser le split '{split_csv}' : {exc}") from exc
-
-    if "pair_id" not in df.columns:
-        raise AppError("Le split ne contient pas la colonne obligatoire pair_id.")
-    if df.empty:
-        raise AppError(f"Le split ne contient aucune ligne : {split_csv}")
-    return df
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
-@st.cache_resource(show_spinner="Chargement du checkpoint U-Net...")
-def load_model(checkpoint_path: str, device_name: str) -> UNet:
-    checkpoint = Path(checkpoint_path)
-    if not checkpoint.exists():
-        raise AppError(f"Checkpoint introuvable : {checkpoint}")
-    if not checkpoint.is_file():
-        raise AppError(f"Le checkpoint n'est pas un fichier : {checkpoint}")
+def img_to_b64(arr: np.ndarray) -> str:
+    buf = io.BytesIO()
+    Image.fromarray(arr.astype(np.uint8)).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
-    device = torch.device(device_name)
-    model = UNet(in_channels=6, num_classes=3, base_channels=BASE_CHANNELS).to(device)
 
+def tensor_to_rgb(tensor: torch.Tensor) -> np.ndarray:
+    arr = tensor.detach().cpu().numpy().transpose(1, 2, 0)
+    return (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+
+
+def read_upload(file, size: int) -> np.ndarray:
+    with Image.open(file) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img = img.resize((size, size), RESAMPLE_BILINEAR)
+        return np.asarray(img, dtype=np.uint8)
+
+
+def colorize(mask: np.ndarray) -> np.ndarray:
+    out = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    for class_id, color in CLASS_COLORS.items():
+        out[mask == class_id] = color
+    return out
+
+
+def colorize_building(mask: np.ndarray | None) -> np.ndarray:
+    if mask is None:
+        return np.zeros((32, 32, 3), dtype=np.uint8)
+    out = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    out[mask.astype(bool)] = np.array([0, 180, 220], dtype=np.uint8)
+    return out
+
+
+def make_overlay(post: np.ndarray, pred: np.ndarray, alpha: float = 0.55) -> np.ndarray:
+    colors = colorize(pred).astype(np.float32)
+    opacity = np.zeros(pred.shape, dtype=np.float32)
+    opacity[pred == 1] = 0.35
+    opacity[pred == 2] = alpha
+    opacity = opacity[:, :, None]
+    return np.clip(post.astype(np.float32) * (1 - opacity) + colors * opacity, 0, 255).astype(np.uint8)
+
+
+def entropy_map(probs: np.ndarray) -> np.ndarray:
+    eps = 1e-8
+    entropy = -np.sum(probs * np.log(probs + eps), axis=-1) / np.log(probs.shape[-1])
     try:
-        loaded = load_checkpoint_file(checkpoint, device)
-        state_dict = extract_state_dict(loaded)
-        model.load_state_dict(state_dict)
-    except OSError as exc:
-        raise AppError(f"Impossible de lire le checkpoint '{checkpoint}' : {exc}") from exc
-    except RuntimeError as exc:
-        raise AppError(
-            "Les poids du checkpoint ne correspondent pas à la configuration "
-            "U-Net 3 classes attendue."
-        ) from exc
+        import matplotlib.cm as mcm
 
-    model.eval()
-    return model
+        return (mcm.plasma(entropy)[:, :, :3] * 255).astype(np.uint8)
+    except ImportError:
+        gray = (entropy * 255).astype(np.uint8)
+        return np.stack([gray, gray, gray], axis=-1)
 
 
-@st.cache_resource(show_spinner="Chargement du modele batiment...")
-def load_building_model(
-    checkpoint_path: str,
-    device_name: str,
-    model_name: str,
-    input_mode: str,
-) -> torch.nn.Module:
-    checkpoint = resolve_project_path(checkpoint_path)
-    if not checkpoint.exists():
-        raise AppError(f"Checkpoint batiment introuvable : {checkpoint}")
-    if not checkpoint.is_file():
-        raise AppError(f"Le checkpoint batiment n'est pas un fichier : {checkpoint}")
-
-    device = torch.device(device_name)
-    try:
-        model, _ = build_building_model(
-            model_name,
-            building_input_channels(input_mode),
-            device,
-        )
-        loaded = load_checkpoint_file(checkpoint, device)
-        if isinstance(loaded, dict) and "model_state_dict" in loaded:
-            state_dict = loaded["model_state_dict"]
-        else:
-            state_dict = loaded
-        model.load_state_dict(clean_building_state_dict(state_dict))
-    except (BuildingTrainingError, RuntimeError, OSError) as exc:
-        raise AppError(
-            "Impossible de charger le modele batiment. Verifiez le checkpoint "
-            "et les dependances segmentation-models-pytorch/timm."
-        ) from exc
-
-    model.eval()
-    return model
+def prediction_stats(pred: np.ndarray) -> dict[str, float | int]:
+    building_pixels = int(np.isin(pred, [1, 2]).sum())
+    damaged_pixels = int((pred == 2).sum())
+    return {
+        "building_pixels": building_pixels,
+        "damaged_pixels": damaged_pixels,
+        "damage_ratio": damaged_pixels / building_pixels if building_pixels else 0.0,
+    }
 
 
-def resolve_project_path(path_text: str) -> Path:
-    path = Path(path_text.strip()).expanduser()
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
-    return path
+def compute_metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, float | int]:
+    confusion = np.zeros((3, 3), dtype=np.float64)
+    valid = (target >= 0) & (target < 3)
+    idx = target[valid].astype(int) * 3 + pred[valid].astype(int)
+    confusion += np.bincount(idx, minlength=9).reshape(3, 3)
+    tp = np.diag(confusion)
+    total = confusion.sum()
+    unions = confusion.sum(1) + confusion.sum(0) - tp
+    iou = np.divide(tp, unions, out=np.full(3, np.nan), where=unions > 0)
+
+    damaged_tp = confusion[2, 2]
+    damaged_pred = confusion[:, 2].sum()
+    damaged_true = confusion[2, :].sum()
+    precision = damaged_tp / damaged_pred if damaged_pred else 0.0
+    recall = damaged_tp / damaged_true if damaged_true else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+    metrics: dict[str, float | int] = {
+        "pixel_accuracy": float(tp.sum() / total) if total else 0.0,
+        "mean_iou": float(np.nanmean(iou)),
+        "iou_background": 0.0 if np.isnan(iou[0]) else float(iou[0]),
+        "iou_no_damage": 0.0 if np.isnan(iou[1]) else float(iou[1]),
+        "iou_damaged": 0.0 if np.isnan(iou[2]) else float(iou[2]),
+        "precision_damaged": float(precision),
+        "recall_damaged": float(recall),
+        "f1_damaged": float(f1),
+    }
+    metrics.update(prediction_stats(pred))
+    return metrics
 
 
-def load_checkpoint_file(path: Path, device: torch.device) -> object:
+def split_csv_path(split: str) -> Path:
+    for split_dir in SPLIT_DIR_CANDIDATES:
+        candidate = split_dir / f"{split}_pairs.csv"
+        if candidate.exists():
+            return candidate
+    return SPLIT_DIR_CANDIDATES[0] / f"{split}_pairs.csv"
+
+
+def load_checkpoint(path: Path, device: torch.device) -> object:
     try:
         return torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=device)
 
 
-def extract_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
+def clean_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
     else:
         state_dict = checkpoint
-
     if not isinstance(state_dict, dict):
-        raise AppError("Le checkpoint n'est pas un state_dict valide.")
-
-    cleaned = {}
-    for key, value in state_dict.items():
-        if isinstance(value, torch.Tensor):
-            cleaned[key.removeprefix("module.")] = value
+        raise AppError("Le checkpoint ne contient pas de state_dict valide.")
+    cleaned = {
+        str(key).removeprefix("module."): value
+        for key, value in state_dict.items()
+        if isinstance(value, torch.Tensor)
+    }
     if not cleaned:
         raise AppError("Le checkpoint ne contient aucun tenseur de poids.")
     return cleaned
 
 
-def load_sample(split_name: str, pair_id: str) -> dict[str, object]:
-    split_csv = SPLITS_DIR / f"{split_name}_pairs.csv"
+def get_disaster(pair_id: str) -> tuple[str, str, str] | None:
+    for prefix, (place, color) in DISASTER_INFO.items():
+        if pair_id.startswith(prefix):
+            return prefix, place, color
+    return None
+
+
+# == Chargement des données et modèles ========================================
+
+
+@st.cache_data(show_spinner=False)
+def load_split(split: str) -> pd.DataFrame:
+    path = split_csv_path(split)
+    if not path.exists():
+        raise AppError(f"Split introuvable : {path}")
+    df = pd.read_csv(path)
+    if "pair_id" not in df.columns or df.empty:
+        raise AppError(f"Split invalide ou vide : {path}")
+    return df
+
+
+@st.cache_resource(show_spinner="Chargement du modèle damage...")
+def load_damage_model(
+    checkpoint: str,
+    model_name: str,
+    in_channels: int,
+    base_channels: int,
+    device_name: str,
+):
+    path = Path(checkpoint)
+    if not path.exists():
+        raise AppError(f"Checkpoint damage manquant : {path}")
+    device = torch.device(device_name)
+    try:
+        model = create_damage_model(
+            model_name,
+            num_classes=3,
+            in_channels=in_channels,
+            base_channels=base_channels,
+        ).to(device)
+    except DamageModelFactoryError as exc:
+        raise AppError(f"Modèle damage non supporté : {model_name}. {exc}") from exc
+
+    checkpoint_obj = load_checkpoint(path, device)
+    try:
+        model.load_state_dict(clean_state_dict(checkpoint_obj))
+    except RuntimeError as exc:
+        raise AppError(
+            "Checkpoint damage incompatible avec le modèle demandé. "
+            f"Modèle : {model_name}. Checkpoint : {path}"
+        ) from exc
+    model.eval()
+    return model
+
+
+@st.cache_resource(show_spinner="Chargement du modèle bâtiment...")
+def load_building_model(device_name: str):
+    if not BUILDING_MODULE_AVAILABLE:
+        raise AppError("Le module building n'est pas disponible : train_building_segmentation.py est introuvable.")
+    if not BUILDING_CHECKPOINT.exists():
+        choices = "\n".join(f"- {path}" for path in BUILDING_CHECKPOINT_CANDIDATES)
+        raise AppError(f"Checkpoint building manquant. Chemins testés :\n{choices}")
+
+    device = torch.device(device_name)
+    try:
+        model, _ = build_building_model(
+            BUILDING_MODEL_NAME,
+            building_input_channels(BUILDING_INPUT_MODE),
+            device,
+        )
+        checkpoint_obj = load_checkpoint(BUILDING_CHECKPOINT, device)
+        state_dict = checkpoint_obj.get("model_state_dict", checkpoint_obj) if isinstance(checkpoint_obj, dict) else checkpoint_obj
+        model.load_state_dict(clean_building_state_dict(state_dict))
+    except (RuntimeError, BuildingTrainingError, OSError, ValueError) as exc:
+        raise AppError(
+            "Checkpoint building incompatible ou modèle building indisponible. "
+            f"Modèle : {BUILDING_MODEL_NAME}. Checkpoint : {BUILDING_CHECKPOINT}"
+        ) from exc
+    model.eval()
+    return model
+
+
+def load_sample(split: str, pair_id: str, image_size: int) -> dict[str, Any]:
     dataset = XBDDataset(
         root=DATA_ROOT,
-        split_csv=split_csv,
-        image_size=IMAGE_SIZE,
+        split_csv=split_csv_path(split),
+        image_size=image_size,
         target_mode=TARGET_MODE,
     )
-    matches = dataset.samples.index[
-        dataset.samples["pair_id"].astype(str) == str(pair_id)
-    ].tolist()
+    matches = dataset.samples.index[dataset.samples["pair_id"].astype(str) == pair_id].tolist()
     if not matches:
-        raise AppError(f"La paire '{pair_id}' est absente de {split_csv}.")
+        raise AppError(f"Paire introuvable dans le split {split} : {pair_id}")
     return dataset[int(matches[0])]
 
 
-@torch.no_grad()
-def predict_with_details(
-    model: UNet,
-    image: torch.Tensor,
-    device_name: str,
-    inference_mode: str,
-    building_checkpoint_path: str,
-    building_threshold: float,
-) -> dict[str, torch.Tensor | None]:
-    device = torch.device(device_name)
-    options = INFERENCE_MODE_OPTIONS[inference_mode]
-    tta_mode = str(options["damage_tta"])
-    image_batch = image.unsqueeze(0).to(device)
-    logits = predict_logits_tta(
-        model=model,
-        image=image_batch,
-        tta_mode=tta_mode,
-    )
-    raw_prediction = torch.argmax(logits, dim=1)
-    if not bool(options["use_building"]):
-        raw_cpu = raw_prediction.squeeze(0).cpu()
-        return {
-            "prediction": raw_cpu,
-            "raw_damage": raw_cpu,
-            "building_mask": None,
-            "post_processed_damage": None,
-        }
-
-    building_model = load_building_model(
-        building_checkpoint_path,
-        device_name,
-        BUILDING_MODEL_NAME,
-        BUILDING_INPUT_MODE,
-    )
-    building_input = select_building_input(image_batch, BUILDING_INPUT_MODE)
-    building_logits = normalize_building_logits(building_model(building_input))
-    building_probs = torch.sigmoid(building_logits).squeeze(1)
-    building_mask = building_probs >= building_threshold
-    post_processed = component_majority_batch(
-        raw_prediction,
-        building_mask,
-        connectivity=BUILDING_COMPONENT_CONNECTIVITY,
-        device=device,
-    )
-    return {
-        "prediction": post_processed.squeeze(0).cpu(),
-        "raw_damage": raw_prediction.squeeze(0).cpu(),
-        "building_mask": building_mask.squeeze(0).cpu(),
-        "post_processed_damage": post_processed.squeeze(0).cpu(),
-    }
+# == Inférence =================================================================
 
 
 @torch.no_grad()
-def predict(
-    model: UNet,
-    image: torch.Tensor,
-    device_name: str,
-    inference_mode: str,
-    building_checkpoint_path: str,
-    building_threshold: float,
-) -> torch.Tensor:
-    """Return only the final prediction for legacy call sites."""
-
-    details = predict_with_details(
-        model,
-        image,
-        device_name,
-        inference_mode,
-        building_checkpoint_path,
-        building_threshold,
-    )
-    prediction = details["prediction"]
-    if prediction is None:
-        raise AppError("Aucune prédiction finale n'a été produite.")
-    return prediction
+def tta_d4_logits(model, batch: torch.Tensor) -> torch.Tensor:
+    total = None
+    for k in range(4):
+        for flip in (False, True):
+            view = torch.rot90(batch, k=k, dims=(-2, -1))
+            if flip:
+                view = torch.flip(view, dims=(-1,))
+            logits = model(view).float()
+            if flip:
+                logits = torch.flip(logits, dims=(-1,))
+            logits = torch.rot90(logits, k=-k, dims=(-2, -1))
+            total = logits if total is None else total + logits
+    return total / 8.0
 
 
-def tta_ops(tta_mode: str) -> list[tuple[int, bool, bool]]:
-    if tta_mode == "none":
-        return [(0, False, False)]
-    if tta_mode == "rot90":
-        return [(rotation, False, False) for rotation in range(4)]
-    if tta_mode == "d4":
-        return [(rotation, False, False) for rotation in range(4)] + [
-            (rotation, True, False) for rotation in range(4)
-        ]
-    raise AppError(f"Mode TTA non pris en charge : {tta_mode}")
-
-
-def apply_tta_op(tensor: torch.Tensor, op: tuple[int, bool, bool]) -> torch.Tensor:
-    rotations, flip_h, flip_v = op
-    output = torch.rot90(tensor, k=rotations, dims=(-2, -1)) if rotations else tensor
-    if flip_h:
-        output = torch.flip(output, dims=(-1,))
-    if flip_v:
-        output = torch.flip(output, dims=(-2,))
-    return output
-
-
-def invert_tta_op(tensor: torch.Tensor, op: tuple[int, bool, bool]) -> torch.Tensor:
-    rotations, flip_h, flip_v = op
-    output = tensor
-    if flip_v:
-        output = torch.flip(output, dims=(-2,))
-    if flip_h:
-        output = torch.flip(output, dims=(-1,))
-    if rotations:
-        output = torch.rot90(output, k=-rotations, dims=(-2, -1))
-    return output
-
-
-@torch.no_grad()
-def predict_logits_tta(
-    model: UNet,
-    image: torch.Tensor,
-    tta_mode: str,
-) -> torch.Tensor:
-    logits_sum: torch.Tensor | None = None
-    ops = tta_ops(tta_mode)
-    for op in ops:
-        view = apply_tta_op(image, op)
-        logits = model(view)
-        logits = invert_tta_op(logits, op).float()
-        logits_sum = logits if logits_sum is None else logits_sum + logits
-    if logits_sum is None:
-        raise AppError(f"Aucune transformation TTA pour le mode : {tta_mode}")
-    return logits_sum / float(len(ops))
-
-
-def select_building_input(images: torch.Tensor, input_mode: str) -> torch.Tensor:
-    if input_mode == "pre":
-        return images[:, :3]
-    if input_mode == "post":
-        return images[:, 3:6]
-    if input_mode == "pre-post":
-        return images
-    raise AppError(f"Mode d'entree batiment non pris en charge : {input_mode}")
-
-
-def component_majority_batch(
-    raw_predictions: torch.Tensor,
-    building_masks: torch.Tensor,
-    connectivity: int,
-    device: torch.device,
-) -> torch.Tensor:
-    outputs = []
-    for prediction_tensor, mask_tensor in zip(raw_predictions, building_masks):
-        prediction = prediction_tensor.detach().cpu().numpy().astype(np.int16, copy=False)
-        building_mask = mask_tensor.detach().cpu().numpy().astype(bool, copy=False)
-        outputs.append(component_majority_single(prediction, building_mask, connectivity))
-    return torch.from_numpy(np.stack(outputs, axis=0)).to(device=device, dtype=torch.long)
-
-
-def component_majority_single(
-    raw_prediction: np.ndarray,
-    building_mask: np.ndarray,
-    connectivity: int,
-) -> np.ndarray:
-    labels, component_count = label_connected_components(building_mask, connectivity)
-    output = np.zeros_like(raw_prediction, dtype=np.int64)
-    for component_id in range(1, component_count + 1):
-        component_mask = labels == component_id
-        component_predictions = raw_prediction[component_mask]
-        no_damage_count = int(np.count_nonzero(component_predictions == 1))
-        damaged_count = int(np.count_nonzero(component_predictions == 2))
-        component_class = 2 if damaged_count > no_damage_count else 1
-        output[component_mask] = component_class
-    return output
-
-
-def label_connected_components(
-    mask: np.ndarray,
-    connectivity: int,
-) -> tuple[np.ndarray, int]:
-    mask = np.asarray(mask, dtype=bool)
-    structure = (
-        np.ones((3, 3), dtype=np.uint8)
-        if connectivity == 8
-        else np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
-    )
-
+def connected_components(mask: np.ndarray) -> tuple[np.ndarray, int]:
     try:
-        from scipy import ndimage  # type: ignore
+        from scipy import ndimage
 
-        labels, count = ndimage.label(mask, structure=structure)
-        return labels.astype(np.int32, copy=False), int(count)
-    except ImportError:
+        return ndimage.label(mask.astype(bool), structure=np.ones((3, 3), dtype=np.uint8))
+    except Exception:
         pass
 
     try:
-        from skimage.measure import label as skimage_label  # type: ignore
+        from skimage.measure import label as sk_label
 
-        sk_connectivity = 2 if connectivity == 8 else 1
-        labels = skimage_label(mask, connectivity=sk_connectivity, background=0)
-        return labels.astype(np.int32, copy=False), int(labels.max())
-    except ImportError:
-        return label_connected_components_fallback(mask, connectivity)
+        labels = sk_label(mask.astype(bool), connectivity=2).astype(np.int32)
+        return labels, int(labels.max())
+    except Exception:
+        pass
 
-
-def label_connected_components_fallback(
-    mask: np.ndarray,
-    connectivity: int,
-) -> tuple[np.ndarray, int]:
-    labels = np.zeros(mask.shape, dtype=np.int32)
     height, width = mask.shape
-    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    if connectivity == 8:
-        neighbors.extend([(-1, -1), (-1, 1), (1, -1), (1, 1)])
-
-    current_label = 0
-    for row in range(height):
-        for col in range(width):
-            if not mask[row, col] or labels[row, col] != 0:
+    labels = np.zeros((height, width), dtype=np.int32)
+    current = 0
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x] or labels[y, x] != 0:
                 continue
-            current_label += 1
-            stack = [(row, col)]
-            labels[row, col] = current_label
+            current += 1
+            labels[y, x] = current
+            stack = [(y, x)]
             while stack:
-                y, x = stack.pop()
-                for dy, dx in neighbors:
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < height and 0 <= nx < width:
-                        if mask[ny, nx] and labels[ny, nx] == 0:
-                            labels[ny, nx] = current_label
+                cy, cx = stack.pop()
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dy == 0 and dx == 0:
+                            continue
+                        ny, nx = cy + dy, cx + dx
+                        if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and labels[ny, nx] == 0:
+                            labels[ny, nx] = current
                             stack.append((ny, nx))
-    return labels, current_label
+    return labels, current
 
 
-def uploaded_pair_to_tensor(
-    pre_file: object,
-    post_file: object,
-    image_size: int,
-) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
-    pre_image = read_uploaded_image(pre_file, image_size)
-    post_image = read_uploaded_image(post_file, image_size)
-    image = np.concatenate([pre_image, post_image], axis=2)
-    tensor = torch.from_numpy(image.transpose(2, 0, 1).copy())
-    tensor = tensor.to(dtype=torch.float32).div(255.0)
-    return tensor, pre_image, post_image
+def component_majority(raw_pred: np.ndarray, building_mask: np.ndarray) -> np.ndarray:
+    labels, n_components = connected_components(building_mask)
+    final_pred = np.zeros_like(raw_pred, dtype=np.int16)
+    for component_id in range(1, n_components + 1):
+        component = labels == component_id
+        values = raw_pred[component]
+        final_pred[component] = 2 if (values == 2).sum() > (values == 1).sum() else 1
+    return final_pred
 
 
-def read_uploaded_image(uploaded_file: object, image_size: int) -> np.ndarray:
-    try:
-        with Image.open(uploaded_file) as image:
-            image = ImageOps.exif_transpose(image).convert("RGB")
-            image = image.resize((image_size, image_size), Image.BILINEAR)
-            return np.asarray(image, dtype=np.uint8)
-    except OSError as exc:
-        raise AppError(f"Impossible de lire l'image téléversée : {exc}") from exc
+@torch.no_grad()
+def run_inference(
+    damage_model,
+    image: torch.Tensor,
+    device_name: str,
+    damage_tta: str,
+    use_building: bool,
+    building_model=None,
+    building_threshold: float = 0.60,
+    building_tta: str = "none",
+) -> dict[str, Any]:
+    device = torch.device(device_name)
+    batch = image.unsqueeze(0).to(device)
 
+    damage_logits = tta_d4_logits(damage_model, batch) if damage_tta == "d4" else damage_model(batch).float()
+    probs = torch.softmax(damage_logits, dim=1).squeeze(0).cpu().numpy().transpose(1, 2, 0)
+    raw_pred = np.argmax(probs, axis=-1).astype(np.int16)
 
-def tensor_to_rgb(tensor: torch.Tensor) -> np.ndarray:
-    array = tensor.detach().cpu().numpy()
-    array = np.transpose(array, (1, 2, 0))
-    array = np.clip(array, 0.0, 1.0)
-    return (array * 255).astype(np.uint8)
+    building_mask = None
+    building_probs = None
+    final_pred = raw_pred.copy()
 
+    if use_building:
+        if building_model is None:
+            raise AppError("Le pipeline building est activé, mais le modèle building n'est pas chargé.")
+        building_input = batch[:, :3]
+        building_logits = (
+            tta_d4_logits(building_model, building_input)
+            if building_tta == "d4"
+            else building_model(building_input).float()
+        )
+        building_logits = normalize_building_logits(building_logits)
+        building_probs = torch.sigmoid(building_logits).squeeze().cpu().numpy().astype(np.float32)
+        building_mask = building_probs >= building_threshold
+        final_pred = component_majority(raw_pred, building_mask)
 
-def tensor_to_optional_numpy(tensor: torch.Tensor | None) -> np.ndarray | None:
-    if tensor is None:
-        return None
-    return tensor.detach().cpu().numpy()
-
-
-def colorize_mask(mask: np.ndarray) -> np.ndarray:
-    color_image = np.zeros((*mask.shape, 3), dtype=np.uint8)
-    for class_id, color in CLASS_COLORS.items():
-        color_image[mask == class_id] = color
-    return color_image
-
-
-def colorize_building_mask(mask: np.ndarray) -> np.ndarray:
-    mask = np.asarray(mask, dtype=bool)
-    color_image = np.zeros((*mask.shape, 3), dtype=np.uint8)
-    color_image[mask] = CLASS_COLORS[1]
-    return color_image
-
-
-def overlay_prediction(post_image: np.ndarray, prediction: np.ndarray) -> np.ndarray:
-    color_mask = colorize_mask(prediction).astype(np.float32)
-    image = post_image.astype(np.float32)
-
-    alpha = np.zeros(prediction.shape, dtype=np.float32)
-    alpha[prediction == 1] = 0.35
-    alpha[prediction == 2] = 0.55
-    alpha = alpha[:, :, None]
-
-    overlay = image * (1.0 - alpha) + color_mask * alpha
-    return np.clip(overlay, 0, 255).astype(np.uint8)
-
-
-def prediction_counts(prediction: np.ndarray) -> tuple[int, int, float]:
-    building_pixels = int(np.isin(prediction, [1, 2]).sum())
-    damaged_pixels = int((prediction == 2).sum())
-    damaged_ratio = damaged_pixels / building_pixels if building_pixels else 0.0
-    return building_pixels, damaged_pixels, damaged_ratio
-
-
-def sample_metrics(prediction: np.ndarray, target: np.ndarray) -> dict[str, float]:
-    confusion = np.zeros((3, 3), dtype=np.float64)
-    valid = (target >= 0) & (target < 3)
-    indices = target[valid] * 3 + prediction[valid]
-    counts = np.bincount(indices, minlength=9).reshape(3, 3)
-    confusion += counts
-
-    true_positive = np.diag(confusion)
-    total = confusion.sum()
-    unions = confusion.sum(axis=1) + confusion.sum(axis=0) - true_positive
-    iou = np.divide(
-        true_positive,
-        unions,
-        out=np.full(3, np.nan, dtype=np.float64),
-        where=unions > 0,
-    )
     return {
-        "pixel_accuracy": float(true_positive.sum() / total) if total else 0.0,
-        "mean_iou": float(np.nanmean(iou)) if not np.all(np.isnan(iou)) else 0.0,
-        "iou_damaged": 0.0 if np.isnan(iou[2]) else float(iou[2]),
+        "raw_pred": raw_pred,
+        "final_pred": final_pred.astype(np.int16),
+        "probs": probs,
+        "building_mask": building_mask,
+        "building_probs": building_probs,
     }
+
+
+def build_result_record(
+    *,
+    pre: np.ndarray,
+    post: np.ndarray,
+    inference: dict[str, Any],
+    target: np.ndarray | None,
+    pair_id: str,
+    model_name: str,
+    pipeline_label: str,
+) -> dict[str, Any]:
+    return {
+        "pre": pre,
+        "post": post,
+        "raw_pred": inference["raw_pred"],
+        "final_pred": inference["final_pred"],
+        "probs": inference["probs"],
+        "building_mask": inference["building_mask"],
+        "building_probs": inference["building_probs"],
+        "target": target,
+        "pair_id": pair_id,
+        "model_name": model_name,
+        "pipeline_label": pipeline_label,
+    }
+
+
+# == Interface =================================================================
+
+
+def render_header(theme: str, model_label: str, device: str, pipeline_label: str) -> None:
+    theme_badge = {"Sombre": "Dark", "Clair": "Light", "Système": "System"}.get(theme, theme)
+    st.markdown(
+        f"""
+<div class="amr-header">
+  <div>
+    <div class="amr-logo">AFTERMATH</div>
+    <div class="amr-tagline">Voir les dégâts pour agir plus vite</div>
+  </div>
+  <div class="amr-badges">
+    <span class="amr-badge accent">{model_label}</span>
+    <span class="amr-badge">{pipeline_label}</span>
+    <span class="amr-badge">{device.upper()}</span>
+    <span class="amr-badge">{theme_badge}</span>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_section(label: str) -> None:
+    st.markdown(f'<div class="section-lbl">{label}</div>', unsafe_allow_html=True)
 
 
 def render_legend() -> None:
     st.markdown(
         """
-        <div style="display:flex; gap:1rem; flex-wrap:wrap; margin:0.25rem 0 1rem;">
-          <span><span style="background:#000000;display:inline-block;width:14px;height:14px;margin-right:6px;border:1px solid #777;"></span>Fond / absence de bâtiment</span>
-          <span><span style="background:#00aa50;display:inline-block;width:14px;height:14px;margin-right:6px;border:1px solid #777;"></span>Bâtiment non endommagé</span>
-          <span><span style="background:#dc2828;display:inline-block;width:14px;height:14px;margin-right:6px;border:1px solid #777;"></span>Bâtiment endommagé</span>
-        </div>
-        """,
+<div class="legend-bar">
+  <div class="leg-item"><span class="leg-dot" style="background:#000;border:1px solid #555;"></span>Fond</div>
+  <div class="leg-item"><span class="leg-dot" style="background:#00aa50;"></span>Bâtiment intact</div>
+  <div class="leg-item"><span class="leg-dot" style="background:#dc2828;"></span>Bâtiment endommagé</div>
+  <div class="leg-item"><span class="leg-dot" style="background:#00b4dc;"></span>Masque bâtiment</div>
+</div>
+""",
         unsafe_allow_html=True,
     )
 
 
-def render_model_summary(
-    device_name: str,
-    inference_mode: str,
-    building_checkpoint_path: str,
-    building_threshold: float,
-) -> None:
-    options = INFERENCE_MODE_OPTIONS[inference_mode]
-    st.sidebar.markdown("### Modèle utilisé")
-    st.sidebar.write(f"Checkpoint damage: `{CHECKPOINT_LABEL}`")
-    st.sidebar.write(f"Appareil: `{device_name}`")
-    st.sidebar.write(f"Taille d'image: `{IMAGE_SIZE}`")
-    st.sidebar.write(f"Mode cible: `{TARGET_MODE}`")
-    st.sidebar.write(f"Pipeline: `{inference_mode}`")
-    st.sidebar.write(f"TTA damage: `{options['damage_tta']}`")
-    if bool(options["use_building"]):
-        st.sidebar.write(f"Checkpoint bâtiment: `{building_checkpoint_path}`")
-        st.sidebar.write(f"Modèle bâtiment: `{BUILDING_MODEL_NAME}` / `{BUILDING_INPUT_MODE}`")
-        st.sidebar.write(f"Seuil bâtiment: `{building_threshold:.2f}`")
+def render_disaster_tag(pair_id: str) -> None:
+    info = get_disaster(pair_id)
+    if not info:
+        return
+    disaster, place, color = info
+    label = disaster.replace("-", " ").title()
+    st.markdown(
+        f'<span style="display:inline-block;border:1px solid {color};color:{color};'
+        f'border-radius:999px;padding:0.18rem 0.65rem;font-size:0.76rem;">'
+        f'{label} · {place}</span>',
+        unsafe_allow_html=True,
+    )
 
 
-def validate_dataset_paths() -> None:
-    if not DATA_ROOT.exists():
-        raise AppError(f"Dossier xBD introuvable : {DATA_ROOT}")
-    if not DATA_ROOT.is_dir():
-        raise AppError(f"Le chemin xBD n'est pas un dossier : {DATA_ROOT}")
-    if not SPLITS_DIR.exists():
-        raise AppError(f"Dossier des splits introuvable : {SPLITS_DIR}")
+def mcard(value: str, label: str) -> str:
+    return f'<div class="mcard"><div class="mval">{value}</div><div class="mlbl">{label}</div></div>'
 
 
-def render_prediction_outputs(
-    pre_image: np.ndarray,
-    post_image: np.ndarray,
-    prediction: np.ndarray,
-    title: str,
-    inference_mode: str,
-    target: np.ndarray | None = None,
-    raw_damage: np.ndarray | None = None,
-    building_mask: np.ndarray | None = None,
-    post_processed_damage: np.ndarray | None = None,
-) -> None:
-    predicted_mask = colorize_mask(prediction)
-    prediction_overlay = overlay_prediction(post_image, prediction)
-
-    st.subheader(title)
-    st.caption(f"Pipeline d'inférence : {inference_mode}")
-    if bool(INFERENCE_MODE_OPTIONS[inference_mode]["use_building"]):
-        st.warning(
-            "Le post-traitement bâtiment améliore les métriques globales actuelles, "
-            "mais il peut encore supprimer de vrais pixels endommagés si la "
-            "segmentation bâtiment les manque."
+def render_metrics_grid(metrics: dict[str, Any], with_iou: bool) -> None:
+    cards = [
+        mcard(f"{metrics.get('damage_ratio', 0.0):.1%}", "Taux dommage"),
+        mcard(f"{int(metrics.get('building_pixels', 0)):,}", "Pixels bâtiment"),
+        mcard(f"{int(metrics.get('damaged_pixels', 0)):,}", "Pixels endommagés"),
+    ]
+    if with_iou:
+        cards.extend(
+            [
+                mcard(f"{metrics.get('pixel_accuracy', 0.0):.3f}", "Pixel accuracy"),
+                mcard(f"{metrics.get('mean_iou', 0.0):.3f}", "Mean IoU"),
+                mcard(f"{metrics.get('iou_damaged', 0.0):.3f}", "IoU damaged"),
+                mcard(f"{metrics.get('f1_damaged', 0.0):.3f}", "F1 damaged"),
+            ]
         )
+    st.markdown(f'<div class="metric-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def render_class_chart(pred: np.ndarray) -> None:
+    total = pred.size
+    labels = ["Fond", "Intact", "Endommagé"]
+    counts = [int((pred == class_id).sum()) for class_id in range(3)]
+    if not PLOTLY_AVAILABLE:
+        for label, count in zip(labels, counts):
+            st.write(f"**{label}** : {count:,} px ({count / total:.1%})")
+        return
+    fig = go.Figure(
+        go.Bar(
+            x=labels,
+            y=[count / total * 100 for count in counts],
+            marker_color=["#1e293b", "#00aa50", "#dc2828"],
+            text=[f"{count / total:.1%}" for count in counts],
+            textposition="outside",
+        )
+    )
+    fig.update_layout(
+        height=230,
+        margin=dict(l=0, r=0, t=10, b=0),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(showgrid=False, showticklabels=False),
+        xaxis=dict(showgrid=False),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_comparison_slider(
+    left_image: np.ndarray,
+    right_image: np.ndarray,
+    left_label: str = "Après",
+    right_label: str = "Overlay final",
+) -> None:
+    height, width = left_image.shape[:2]
+    container_height = min(int(900 * height / width), 620)
+    b64_left = img_to_b64(left_image)
+    b64_right = img_to_b64(right_image)
+    html = f"""
+<div id="cmp" style="position:relative;width:100%;height:{container_height}px;overflow:hidden;border-radius:10px;cursor:col-resize;background:#000;">
+  <img src="data:image/png;base64,{b64_left}" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;">
+  <div id="cmp-over" style="position:absolute;inset:0;width:50%;overflow:hidden;">
+    <img id="cmp-right" src="data:image/png;base64,{b64_right}" style="position:absolute;top:0;left:0;height:100%;object-fit:contain;">
+  </div>
+  <div id="cmp-bar" style="position:absolute;top:0;left:50%;width:2px;height:100%;background:white;box-shadow:0 0 8px rgba(0,0,0,.45);"></div>
+  <div style="position:absolute;bottom:10px;left:12px;background:rgba(0,0,0,.65);color:white;font-size:12px;padding:4px 10px;border-radius:6px;">{left_label}</div>
+  <div style="position:absolute;bottom:10px;right:12px;background:rgba(220,40,40,.85);color:white;font-size:12px;padding:4px 10px;border-radius:6px;">{right_label}</div>
+</div>
+<script>
+(function() {{
+  const cmp = document.getElementById('cmp');
+  const over = document.getElementById('cmp-over');
+  const bar = document.getElementById('cmp-bar');
+  const right = document.getElementById('cmp-right');
+  let dragging = false;
+  function syncWidth() {{ right.style.width = cmp.getBoundingClientRect().width + 'px'; }}
+  function setPos(evt) {{
+    const rect = cmp.getBoundingClientRect();
+    const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+    const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
+    const pct = x / rect.width * 100;
+    over.style.width = pct + '%';
+    bar.style.left = pct + '%';
+    syncWidth();
+  }}
+  cmp.addEventListener('mousedown', e => {{ dragging = true; setPos(e); }});
+  document.addEventListener('mouseup', () => dragging = false);
+  document.addEventListener('mousemove', e => {{ if (dragging) setPos(e); }});
+  cmp.addEventListener('touchstart', e => {{ dragging = true; setPos(e); }}, {{passive:true}});
+  document.addEventListener('touchend', () => dragging = false);
+  document.addEventListener('touchmove', e => {{ if (dragging) setPos(e); }}, {{passive:true}});
+  window.addEventListener('load', syncWidth);
+  setTimeout(syncWidth, 200);
+}})();
+</script>
+"""
+    components.html(html, height=container_height + 12)
+
+
+def render_download(
+    final_pred: np.ndarray,
+    post: np.ndarray,
+    metrics: dict[str, Any] | None,
+    pair_id: str,
+    model_name: str,
+) -> None:
+    col_mask, col_overlay, col_json = st.columns(3)
+
+    mask_buffer = io.BytesIO()
+    Image.fromarray(colorize(final_pred)).save(mask_buffer, format="PNG")
+    col_mask.download_button(
+        "Masque PNG",
+        mask_buffer.getvalue(),
+        file_name=f"mask_{pair_id}_{datetime.now():%H%M%S}.png",
+        mime="image/png",
+        use_container_width=True,
+    )
+
+    overlay_buffer = io.BytesIO()
+    Image.fromarray(make_overlay(post, final_pred)).save(overlay_buffer, format="PNG")
+    col_overlay.download_button(
+        "Overlay PNG",
+        overlay_buffer.getvalue(),
+        file_name=f"overlay_{pair_id}_{datetime.now():%H%M%S}.png",
+        mime="image/png",
+        use_container_width=True,
+    )
+
+    report = {
+        "generated_at": datetime.now().isoformat(),
+        "pair_id": pair_id,
+        "model": model_name,
+        "metrics": metrics or {},
+        "target_mode": TARGET_MODE,
+    }
+    col_json.download_button(
+        "Rapport JSON",
+        json.dumps(report, indent=2, ensure_ascii=False),
+        file_name=f"report_{pair_id}_{datetime.now():%H%M%S}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+
+def add_to_history(pair_id: str, model_name: str, pipeline_label: str, stats: dict[str, Any]) -> None:
+    history = st.session_state.setdefault("history", [])
+    history.append(
+        {
+            "pair_id": pair_id,
+            "model": model_name,
+            "pipeline": pipeline_label,
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "damage_ratio": float(stats.get("damage_ratio", 0.0)),
+        }
+    )
+
+
+def render_history() -> None:
+    history = st.session_state.get("history", [])
+    if not history:
+        st.caption("Aucune analyse dans cette session.")
+        return
+    for item in reversed(history[-8:]):
+        st.markdown(
+            f"""
+<div class="history-row">
+  <div>
+    <div class="hr-id">{item['pair_id']}</div>
+    <div class="hr-meta">{item['model']} · {item['pipeline']} · {item['time']}</div>
+  </div>
+  <div style="text-align:right;">
+    <div class="hr-dmg">{item['damage_ratio']:.1%}</div>
+    <div class="hr-meta">dommage</div>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+
+def render_results(record: dict[str, Any], use_building: bool) -> None:
+    pre = record["pre"]
+    post = record["post"]
+    raw_pred = record["raw_pred"]
+    final_pred = record["final_pred"]
+    probs = record["probs"]
+    building_mask = record["building_mask"]
+    building_probs = record["building_probs"]
+    target = record["target"]
+    pair_id = record["pair_id"]
+    model_name = record["model_name"]
+    pipeline_label = record["pipeline_label"]
+
+    metrics = compute_metrics(final_pred, target) if target is not None else None
+    stats = metrics or prediction_stats(final_pred)
+    overlay_final = make_overlay(post, final_pred)
+
     render_legend()
+    tabs = st.tabs(["Visualisation", "Métriques", "Incertitude du modèle", "Exporter"])
 
-    st.markdown("## Résultat principal")
-    st.image(
-        prediction_overlay,
-        caption="Superposition de la prédiction sur l'image après catastrophe",
-        width="stretch",
-    )
+    with tabs[0]:
+        render_disaster_tag(pair_id)
+        st.caption(f"Pipeline sélectionné : {pipeline_label}")
+        if use_building:
+            st.warning(
+                "Le post-processing bâtiment peut améliorer la précision, mais il peut aussi retirer "
+                "de vrais pixels endommagés si le masque bâtiment manque une structure."
+            )
 
-    if target is None:
-        st.info("Aucune vérité terrain fournie — inférence uniquement.")
+        render_section("Résultat principal")
+        render_comparison_slider(post, overlay_final, "Après catastrophe", "Overlay final")
 
-    if bool(INFERENCE_MODE_OPTIONS[inference_mode]["use_building"]):
-        render_visual_explainability(
-            post_image=post_image,
-            raw_damage=raw_damage,
-            building_mask=building_mask,
-            post_processed_damage=post_processed_damage,
-            final_overlay=prediction_overlay,
+        render_section("Explicabilité visuelle")
+        row1 = st.columns(3)
+        row1[0].image(pre, caption="Image avant catastrophe", use_container_width=True)
+        row1[1].image(post, caption="Image après catastrophe", use_container_width=True)
+        row1[2].image(colorize(raw_pred), caption="Damage brut / TTA d4", use_container_width=True)
+
+        row2 = st.columns(3)
+        if building_mask is not None:
+            row2[0].image(colorize_building(building_mask), caption="Masque bâtiment prédit", use_container_width=True)
+        else:
+            row2[0].image(np.zeros_like(post), caption="Masque bâtiment non utilisé", use_container_width=True)
+        row2[1].image(colorize(final_pred), caption="Damage final post-processé", use_container_width=True)
+        if target is not None:
+            row2[2].image(colorize(target), caption="Vérité terrain", use_container_width=True)
+        else:
+            row2[2].image(overlay_final, caption="Overlay final", use_container_width=True)
+
+    with tabs[1]:
+        if metrics is not None:
+            render_section("Métriques de la paire")
+            render_metrics_grid(metrics, with_iou=True)
+            left, right = st.columns(2)
+            with left:
+                render_section("Distribution finale prédite")
+                render_class_chart(final_pred)
+            with right:
+                render_section("Distribution vérité terrain")
+                render_class_chart(target)
+        else:
+            render_section("Statistiques de prédiction")
+            render_metrics_grid(stats, with_iou=False)
+            st.info("Aucune vérité terrain fournie - inférence uniquement.")
+            render_section("Distribution finale prédite")
+            render_class_chart(final_pred)
+
+        if building_probs is not None:
+            render_section("Probabilité bâtiment")
+            st.caption(f"Pixels bâtiment retenus : {int(building_mask.sum()) if building_mask is not None else 0:,}")
+            st.image((np.clip(building_probs, 0, 1) * 255).astype(np.uint8), use_container_width=True)
+
+    with tabs[2]:
+        render_section("Carte d'entropie")
+        st.markdown(
+            """
+<div class="info-strip">
+L'entropie visualise l'incertitude du modèle pixel par pixel. Les zones chaudes sont
+souvent des contours de bâtiments, des textures ambiguës ou des régions où le modèle
+hésite entre bâtiment intact et bâtiment endommagé.
+</div>
+""",
+            unsafe_allow_html=True,
         )
+        st.image(entropy_map(probs), caption="Entropie normalisée", use_container_width=True)
 
-    st.markdown("## Détails de l'inférence")
-    detail_cols = st.columns(3)
-    detail_cols[0].image(pre_image, caption="Image avant catastrophe", width="stretch")
-    detail_cols[1].image(post_image, caption="Image après catastrophe", width="stretch")
-    detail_cols[2].image(predicted_mask, caption="Prédiction du modèle", width="stretch")
-
-    if target is not None:
-        with st.expander("Vérité terrain et métriques de la paire", expanded=True):
-            comparison_cols = st.columns(3)
-            comparison_cols[0].image(
-                colorize_mask(target),
-                caption="Vérité terrain",
-                width="stretch",
-            )
-            comparison_cols[1].image(
-                predicted_mask,
-                caption="Prédiction du modèle",
-                width="stretch",
-            )
-            comparison_cols[2].image(
-                prediction_overlay,
-                caption="Superposition",
-                width="stretch",
+        render_section("Probabilités par classe")
+        prob_cols = st.columns(3)
+        for class_id, label in enumerate(["Fond", "Bâtiment intact", "Bâtiment endommagé"]):
+            prob_cols[class_id].image(
+                (probs[:, :, class_id] * 255).astype(np.uint8),
+                caption=label,
+                use_container_width=True,
             )
 
-            building_pixels, damaged_pixels, damaged_ratio = prediction_counts(prediction)
-            metrics = sample_metrics(prediction, target)
-            metric_cols = st.columns(6)
-            metric_cols[0].metric("Pixels bâtiments prédits", f"{building_pixels:,}")
-            metric_cols[1].metric("Pixels endommagés prédits", f"{damaged_pixels:,}")
-            metric_cols[2].metric("Part endommagée prédite", f"{damaged_ratio:.2%}")
-            metric_cols[3].metric("Pixel accuracy", f"{metrics['pixel_accuracy']:.3f}")
-            metric_cols[4].metric("Mean IoU", f"{metrics['mean_iou']:.3f}")
-            metric_cols[5].metric("IoU damaged", f"{metrics['iou_damaged']:.3f}")
+    with tabs[3]:
+        render_section("Télécharger les résultats")
+        render_download(final_pred, post, metrics, pair_id, model_name)
+        render_section("Historique")
+        render_history()
 
 
-def render_visual_explainability(
-    post_image: np.ndarray,
-    raw_damage: np.ndarray | None,
-    building_mask: np.ndarray | None,
-    post_processed_damage: np.ndarray | None,
-    final_overlay: np.ndarray,
-) -> None:
-    st.markdown("## Explicabilité visuelle")
-    st.caption(
-        "Le mode bêta montre les masques intermédiaires utilisés pour passer "
-        "de la prédiction damage brute à la carte finale post-traitée."
+def render_sidebar() -> dict[str, Any]:
+    st.sidebar.markdown("**Thème**")
+    theme = st.sidebar.radio(
+        "Thème",
+        THEME_LABELS,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="theme_choice",
     )
+    st.sidebar.divider()
 
-    if raw_damage is None or building_mask is None or post_processed_damage is None:
-        st.info("Les masques intermédiaires ne sont pas disponibles pour cette inférence.")
-        return
-
-    cols = st.columns(4)
-    cols[0].image(
-        post_image,
-        caption="1. Image post-catastrophe",
-        width="stretch",
+    st.sidebar.markdown("**Modèle damage**")
+    model_id = st.sidebar.selectbox(
+        "Modèle damage",
+        list(DAMAGE_MODELS),
+        index=0,
+        format_func=lambda key: DAMAGE_MODELS[key]["label"],
+        label_visibility="collapsed",
     )
-    cols[1].image(
-        colorize_mask(raw_damage),
-        caption="2. Damage brut / TTA d4",
-        width="stretch",
-    )
-    cols[2].image(
-        colorize_building_mask(building_mask),
-        caption="3. Masque bâtiment prédit",
-        width="stretch",
-    )
-    cols[3].image(
-        colorize_mask(post_processed_damage),
-        caption="4. Damage après component majority",
-        width="stretch",
-    )
-
-    with st.expander("Overlay final sur l'image post-catastrophe", expanded=True):
-        st.image(
-            final_overlay,
-            caption="5. Overlay final : damage post-processé sur image après catastrophe",
-            width="stretch",
-        )
-
-
-def render_dataset_mode(
-    device_name: str,
-    inference_mode: str,
-    building_checkpoint_path: str,
-    building_threshold: float,
-) -> None:
-    try:
-        validate_dataset_paths()
-    except AppError as exc:
-        st.error(str(exc))
-        st.stop()
-
-    split_name = st.sidebar.selectbox("Jeu de données", ["train", "val", "test"], index=2)
-    try:
-        split_df = load_split(split_name)
-    except AppError as exc:
-        st.error(str(exc))
-        st.stop()
-
-    all_pair_ids = split_df["pair_id"].astype(str).tolist()
-    recommended_for_split = RECOMMENDED_PAIR_IDS_BY_SPLIT.get(split_name, [])
-    all_pair_ids_set = set(all_pair_ids)
-    available_recommended_ids = [
-        pair_id for pair_id in recommended_for_split if pair_id in all_pair_ids_set
-    ]
-    available_demo_ids = [
-        pair_id for pair_id in JALON3_DEMO_PAIR_IDS if pair_id in all_pair_ids_set
-    ]
-
-    pair_source = st.sidebar.radio(
-        "Sélection des paires",
-        ["Toutes les paires disponibles", "Exemples recommandés", "Démo Jalon 3"],
-    )
-    if pair_source == "Exemples recommandés" and available_recommended_ids:
-        pair_ids = available_recommended_ids
-    elif pair_source == "Démo Jalon 3" and available_demo_ids:
-        pair_ids = available_demo_ids
+    model_cfg = DAMAGE_MODELS[model_id]
+    st.sidebar.caption(model_cfg["description"])
+    if model_cfg["checkpoint"].exists():
+        st.sidebar.success("Checkpoint damage disponible.")
     else:
-        pair_ids = all_pair_ids
-        if pair_source != "Toutes les paires disponibles":
-            st.sidebar.info(
-                "Ces exemples ne sont pas disponibles dans le split courant. "
-                "Toutes les paires sont affichées."
+        st.sidebar.error(f"Checkpoint damage manquant : {rel_path(model_cfg['checkpoint'])}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cuda_available = device == "cuda"
+    building_available = BUILDING_MODULE_AVAILABLE and BUILDING_CHECKPOINT.exists()
+
+    st.sidebar.divider()
+    st.sidebar.markdown("**Résumé modèle**")
+    st.sidebar.caption("Damage champion v2 : F1 damaged = 0.7013")
+    st.sidebar.caption("Building b400 : F1 building = 0.8504")
+    if cuda_available and building_available:
+        st.sidebar.success("Pipeline recommandé : Qualité maximale")
+    else:
+        st.sidebar.info("Pipeline recommandé : Qualité si CUDA ou building indisponible")
+
+    st.sidebar.divider()
+    st.sidebar.markdown("**Modèle bâtiment**")
+    st.sidebar.caption(f"Architecture : {BUILDING_MODEL_NAME}")
+    if building_available:
+        st.sidebar.success("Checkpoint building b400 disponible.")
+        st.sidebar.caption(rel_path(BUILDING_CHECKPOINT))
+    else:
+        st.sidebar.warning("Checkpoint building b400 non disponible.")
+        st.sidebar.caption(rel_path(BUILDING_CHECKPOINT))
+
+    st.sidebar.divider()
+    st.sidebar.markdown("**Pipeline**")
+    pipeline_ids = list(PIPELINES)
+    default_pipeline_index = pipeline_ids.index("damage_tta_building") if cuda_available and building_available else pipeline_ids.index("damage_tta")
+    pipeline_id = st.sidebar.selectbox(
+        "Pipeline",
+        pipeline_ids,
+        index=default_pipeline_index,
+        format_func=lambda key: PIPELINES[key]["label"],
+        label_visibility="collapsed",
+    )
+    pipeline_cfg = PIPELINES[pipeline_id]
+    st.sidebar.caption(pipeline_cfg["description"])
+
+    building_threshold = 0.60
+    building_tta = "none"
+    pipeline_ready = True
+    if pipeline_cfg["use_building"]:
+        if not building_available:
+            st.sidebar.error("Le pipeline qualité maximale exige le checkpoint building.")
+            pipeline_ready = False
+        building_threshold = st.sidebar.slider("Seuil bâtiment", 0.10, 0.90, 0.60, 0.05)
+        use_building_tta = st.sidebar.toggle("TTA d4 building", value=cuda_available)
+        building_tta = "d4" if use_building_tta else "none"
+
+    if not cuda_available:
+        st.sidebar.warning("CUDA indisponible : l'inférence CPU sera lente.")
+
+    st.sidebar.divider()
+    st.sidebar.markdown("**Source de données**")
+    source_mode = st.sidebar.radio(
+        "Source",
+        list(SOURCE_MODES),
+        index=0,
+        format_func=lambda key: SOURCE_MODES[key],
+        label_visibility="collapsed",
+    )
+
+    st.sidebar.divider()
+    st.sidebar.caption(f"Appareil : {device.upper()} · Image : {model_cfg['image_size']} px · Target : {TARGET_MODE}")
+
+    return {
+        "theme": theme,
+        "device": device,
+        "model_id": model_id,
+        "model_cfg": model_cfg,
+        "model_label": model_cfg["label"],
+        "pipeline_id": pipeline_id,
+        "pipeline_label": pipeline_cfg["label"],
+        "pipeline_ready": pipeline_ready,
+        "damage_tta": pipeline_cfg["damage_tta"],
+        "use_building": bool(pipeline_cfg["use_building"]),
+        "building_threshold": building_threshold,
+        "building_tta": building_tta,
+        "source_mode": source_mode,
+    }
+
+
+def prepare_models(cfg: dict[str, Any]):
+    model_cfg = cfg["model_cfg"]
+    damage_model = load_damage_model(
+        str(model_cfg["checkpoint"]),
+        model_cfg["model_name"],
+        int(model_cfg["in_channels"]),
+        int(model_cfg["base_channels"]),
+        cfg["device"],
+    )
+    building_model = load_building_model(cfg["device"]) if cfg["use_building"] else None
+    return damage_model, building_model
+
+
+def render_dataset_mode(cfg: dict[str, Any]) -> None:
+    if not DATA_ROOT.exists():
+        st.error(f"Données xBD introuvables : `{DATA_ROOT}`")
+        return
+
+    all_ids: list[str] = []
+    for split in ("test", "val", "train"):
+        try:
+            all_ids.extend(load_split(split)["pair_id"].astype(str).tolist())
+        except AppError:
+            continue
+    if not all_ids:
+        st.error("Aucune paire disponible dans les splits.")
+        return
+
+    seen: set[str] = set()
+    unique_ids = [pair_id for pair_id in all_ids if not (pair_id in seen or seen.add(pair_id))]
+    recommended = [pair_id for pair_id in RECOMMENDED_PAIR_IDS if pair_id in set(unique_ids)]
+    show_recommended = st.sidebar.toggle("Exemples recommandés uniquement", value=bool(recommended))
+    pair_ids = recommended if show_recommended and recommended else unique_ids
+
+    col_select, col_button = st.columns([4, 1])
+    pair_id = col_select.selectbox("Paire xBD", pair_ids, label_visibility="collapsed")
+    analyze = col_button.button("Analyser", type="primary", use_container_width=True)
+
+    cache_key = (
+        "dataset",
+        pair_id,
+        cfg["model_id"],
+        cfg["pipeline_id"],
+        cfg["building_threshold"],
+        cfg["building_tta"],
+    )
+    if analyze:
+        st.session_state["dataset_pending_key"] = cache_key
+
+    if st.session_state.get("dataset_pending_key") == cache_key and st.session_state.get("dataset_done_key") != cache_key:
+        split_for_pair = "test"
+        for split in ("test", "val", "train"):
+            try:
+                if pair_id in load_split(split)["pair_id"].astype(str).values:
+                    split_for_pair = split
+                    break
+            except AppError:
+                continue
+
+        with st.spinner("Analyse en cours..."):
+            try:
+                sample = load_sample(split_for_pair, pair_id, int(cfg["model_cfg"]["image_size"]))
+                damage_model, building_model = prepare_models(cfg)
+                inference = run_inference(
+                    damage_model,
+                    sample["image"],
+                    cfg["device"],
+                    cfg["damage_tta"],
+                    cfg["use_building"],
+                    building_model,
+                    cfg["building_threshold"],
+                    cfg["building_tta"],
+                )
+            except (AppError, XBDDatasetError, RuntimeError, OSError, ValueError) as exc:
+                st.error(str(exc))
+                return
+
+        target = sample["target"].detach().cpu().numpy()
+        record = build_result_record(
+            pre=tensor_to_rgb(sample["image"][:3]),
+            post=tensor_to_rgb(sample["image"][3:6]),
+            inference=inference,
+            target=target,
+            pair_id=pair_id,
+            model_name=cfg["model_label"],
+            pipeline_label=cfg["pipeline_label"],
+        )
+        st.session_state["dataset_cache_key"] = cache_key
+        st.session_state["dataset_cache"] = record
+        st.session_state["dataset_done_key"] = cache_key
+        add_to_history(pair_id, cfg["model_label"], cfg["pipeline_label"], compute_metrics(record["final_pred"], target))
+
+    record = None
+    if st.session_state.get("dataset_cache_key") == cache_key:
+        record = st.session_state.get("dataset_cache")
+    if record is None:
+        st.info("Sélectionnez une paire et cliquez sur Analyser.")
+        return
+    render_results(record, cfg["use_building"])
+
+
+def render_upload_mode(cfg: dict[str, Any]) -> None:
+    render_section("Téléverser une paire d'images satellite")
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("**Image avant catastrophe**")
+        pre_file = st.file_uploader(
+            "Image avant catastrophe",
+            type=["png", "jpg", "jpeg", "tif", "tiff"],
+            key="upload_pre",
+            label_visibility="collapsed",
+        )
+        if pre_file:
+            st.image(read_upload(pre_file, int(cfg["model_cfg"]["image_size"])), caption="Aperçu - Avant", use_container_width=True)
+
+    with right:
+        st.markdown("**Image après catastrophe**")
+        post_file = st.file_uploader(
+            "Image après catastrophe",
+            type=["png", "jpg", "jpeg", "tif", "tiff"],
+            key="upload_post",
+            label_visibility="collapsed",
+        )
+        if post_file:
+            st.image(read_upload(post_file, int(cfg["model_cfg"]["image_size"])), caption="Aperçu - Après", use_container_width=True)
+
+    both_ready = pre_file is not None and post_file is not None
+    if not both_ready:
+        st.info("Chargez une image avant et une image après pour activer l'inférence.")
+
+    analyze = st.button(
+        "Lancer l'inférence" if both_ready else "En attente des deux images",
+        type="primary",
+        disabled=not both_ready,
+        use_container_width=True,
+    )
+
+    upload_key = None
+    if both_ready:
+        upload_key = (
+            "upload",
+            pre_file.name,
+            pre_file.size,
+            post_file.name,
+            post_file.size,
+            cfg["model_id"],
+            cfg["pipeline_id"],
+            cfg["building_threshold"],
+            cfg["building_tta"],
+        )
+
+    has_upload_cache = (
+        upload_key is not None
+        and st.session_state.get("upload_cache_key") == upload_key
+        and "upload_cache" in st.session_state
+    )
+
+    if has_upload_cache and not analyze:
+        render_results(st.session_state["upload_cache"], cfg["use_building"])
+        return
+
+    if not analyze:
+        return
+
+    with st.spinner("Analyse satellite en cours..."):
+        try:
+            size = int(cfg["model_cfg"]["image_size"])
+            pre_np = read_upload(pre_file, size)
+            post_np = read_upload(post_file, size)
+            stacked = np.concatenate([pre_np, post_np], axis=2).transpose(2, 0, 1)
+            image = torch.from_numpy(stacked.copy()).float().div(255.0)
+            damage_model, building_model = prepare_models(cfg)
+            inference = run_inference(
+                damage_model,
+                image,
+                cfg["device"],
+                cfg["damage_tta"],
+                cfg["use_building"],
+                building_model,
+                cfg["building_threshold"],
+                cfg["building_tta"],
             )
+        except (AppError, RuntimeError, OSError, ValueError) as exc:
+            st.error(str(exc))
+            return
 
-    st.sidebar.markdown("#### Paires de démo Jalon 3")
-    for pair_id in JALON3_DEMO_PAIR_IDS:
-        st.sidebar.caption(pair_id)
-
-    pair_id = st.selectbox("Paire d'images", pair_ids)
-
-    try:
-        sample = load_sample(split_name, pair_id)
-        model = load_model(str(CHECKPOINT_PATH), device_name)
-        inference_details = predict_with_details(
-            model,
-            sample["image"],
-            device_name,
-            inference_mode,
-            building_checkpoint_path,
-            building_threshold,
-        )
-    except (
-        AppError,
-        XBDDatasetError,
-        BuildingTrainingError,
-        RuntimeError,
-        OSError,
-        ValueError,
-    ) as exc:
-        st.error(str(exc))
-        st.info(f"Checkpoint attendu : `{CHECKPOINT_PATH}`")
-        if bool(INFERENCE_MODE_OPTIONS[inference_mode]["use_building"]):
-            st.info(f"Checkpoint bâtiment attendu : `{building_checkpoint_path}`")
-        st.stop()
-
-    image_tensor = sample["image"]
-    target = sample["target"].detach().cpu().numpy()
-    prediction = inference_details["prediction"]
-    if prediction is None:
-        raise AppError("Aucune prédiction finale n'a été produite.")
-    pred = prediction.numpy()
-    pre_image = tensor_to_rgb(image_tensor[:3])
-    post_image = tensor_to_rgb(image_tensor[3:6])
-
-    render_prediction_outputs(
-        pre_image=pre_image,
-        post_image=post_image,
-        prediction=pred,
-        target=target,
-        inference_mode=inference_mode,
-        title=f"Paire sélectionnée : `{pair_id}`",
-        raw_damage=tensor_to_optional_numpy(inference_details["raw_damage"]),
-        building_mask=tensor_to_optional_numpy(inference_details["building_mask"]),
-        post_processed_damage=tensor_to_optional_numpy(
-            inference_details["post_processed_damage"]
-        ),
-    )
-
-    with st.expander("Détails de l'échantillon"):
-        st.write(f"Lignes du split sélectionné : `{len(split_df):,}`")
-        st.write(f"Forme du tenseur d'entrée : `{tuple(image_tensor.shape)}`")
-        st.write(f"Classes de vérité terrain : `{np.unique(target).tolist()}`")
-        st.write(f"Classes prédites : `{np.unique(pred).tolist()}`")
-
-
-def render_upload_mode(
-    device_name: str,
-    inference_mode: str,
-    building_checkpoint_path: str,
-    building_threshold: float,
-) -> None:
-    st.subheader("Téléverser une paire réelle")
-    st.write(
-        "Téléversez une image avant catastrophe et une image après catastrophe. "
-        "Les deux images seront redimensionnées au format du modèle pour l'inférence."
-    )
-
-    upload_cols = st.columns(2)
-    pre_file = upload_cols[0].file_uploader(
-        "Image avant catastrophe",
-        type=["png", "jpg", "jpeg", "tif", "tiff"],
-        key="upload_pre",
-    )
-    post_file = upload_cols[1].file_uploader(
-        "Image après catastrophe",
-        type=["png", "jpg", "jpeg", "tif", "tiff"],
-        key="upload_post",
-    )
-
-    run_clicked = st.button("Lancer l'inférence", type="primary")
-    if not run_clicked:
-        st.info("Ajoutez les deux images, puis lancez l'inférence.")
-        return
-    if pre_file is None or post_file is None:
-        st.error("Veuillez fournir les deux images : avant et après catastrophe.")
-        return
-
-    try:
-        image_tensor, pre_image, post_image = uploaded_pair_to_tensor(
-            pre_file,
-            post_file,
-            IMAGE_SIZE,
-        )
-        model = load_model(str(CHECKPOINT_PATH), device_name)
-        inference_details = predict_with_details(
-            model,
-            image_tensor,
-            device_name,
-            inference_mode,
-            building_checkpoint_path,
-            building_threshold,
-        )
-    except (
-        AppError,
-        BuildingTrainingError,
-        RuntimeError,
-        OSError,
-        ValueError,
-    ) as exc:
-        st.error(str(exc))
-        st.info(f"Checkpoint attendu : `{CHECKPOINT_PATH}`")
-        if bool(INFERENCE_MODE_OPTIONS[inference_mode]["use_building"]):
-            st.info(f"Checkpoint bâtiment attendu : `{building_checkpoint_path}`")
-        st.stop()
-
-    prediction = inference_details["prediction"]
-    if prediction is None:
-        raise AppError("Aucune prédiction finale n'a été produite.")
-    render_prediction_outputs(
-        pre_image=pre_image,
-        post_image=post_image,
-        prediction=prediction.numpy(),
+    pair_id = f"upload_{datetime.now():%Y%m%d_%H%M%S}"
+    record = build_result_record(
+        pre=pre_np,
+        post=post_np,
+        inference=inference,
         target=None,
-        inference_mode=inference_mode,
-        title="Résultat d'inférence sur images téléversées",
-        raw_damage=tensor_to_optional_numpy(inference_details["raw_damage"]),
-        building_mask=tensor_to_optional_numpy(inference_details["building_mask"]),
-        post_processed_damage=tensor_to_optional_numpy(
-            inference_details["post_processed_damage"]
-        ),
+        pair_id=pair_id,
+        model_name=cfg["model_label"],
+        pipeline_label=cfg["pipeline_label"],
     )
+    st.session_state["upload_cache_key"] = upload_key
+    st.session_state["upload_cache"] = record
+    add_to_history(pair_id, cfg["model_label"], cfg["pipeline_label"], prediction_stats(record["final_pred"]))
+    render_results(record, cfg["use_building"])
 
 
 def main() -> None:
-    st.set_page_config(page_title="Aftermath", layout="wide")
-    st.title("Aftermath")
-    st.caption("Prototype de cartographie automatique des dommages par imagerie satellite")
-
-    device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    building_checkpoint_default = str(BUILDING_CHECKPOINT_PATH)
-    building_checkpoint_exists = BUILDING_CHECKPOINT_PATH.exists()
-    inference_modes = list(INFERENCE_MODE_OPTIONS.keys())
-    default_mode = (
-        "Damage + TTA d4 + building component majority"
-        if building_checkpoint_exists
-        else "Damage + TTA d4"
-    )
-    inference_mode = st.sidebar.selectbox(
-        "Pipeline d'inférence",
-        inference_modes,
-        index=inference_modes.index(default_mode),
-        help=(
-            "Le mode downstream ajoute une segmentation bâtiment prédite et "
-            "une décision majoritaire par composante."
-        ),
-    )
-    st.sidebar.caption(str(INFERENCE_MODE_OPTIONS[inference_mode]["description"]))
-    building_checkpoint_path = st.sidebar.text_input(
-        "Checkpoint bâtiment",
-        value=building_checkpoint_default,
-        help=f"Checkpoint recommandé : {BUILDING_CHECKPOINT_LABEL}",
-    )
-    building_threshold = st.sidebar.slider(
-        "Seuil bâtiment",
-        min_value=0.10,
-        max_value=0.90,
-        value=0.60,
-        step=0.05,
-    )
-    if (
-        inference_mode == "Damage + TTA d4 + building component majority"
-        and not resolve_project_path(building_checkpoint_path).exists()
-    ):
-        st.sidebar.warning(
-            "Checkpoint bâtiment introuvable : le mode TTA d4 seul reste disponible."
-        )
-
-    render_model_summary(
-        device_name,
-        inference_mode,
-        building_checkpoint_path,
-        building_threshold,
+    st.set_page_config(
+        page_title="Aftermath",
+        page_icon="satellite",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
 
-    mode = st.sidebar.radio(
-        "Mode",
-        ["Dataset xBD", "Téléverser une paire réelle"],
-        help="Le mode téléversement ne nécessite pas de vérité terrain.",
-    )
+    cfg = render_sidebar()
+    st.markdown(build_css(cfg["theme"]), unsafe_allow_html=True)
+    render_header(cfg["theme"], cfg["model_label"], cfg["device"], cfg["pipeline_label"])
 
-    if mode == "Dataset xBD":
-        render_dataset_mode(
-            device_name,
-            inference_mode,
-            building_checkpoint_path,
-            building_threshold,
-        )
+    if not cfg["model_cfg"]["checkpoint"].exists():
+        st.error(f"Checkpoint damage introuvable : `{cfg['model_cfg']['checkpoint']}`")
+        st.stop()
+    if not cfg["pipeline_ready"]:
+        st.error("Pipeline sélectionné indisponible : vérifiez le checkpoint building ou choisissez un autre mode.")
+        st.stop()
+
+    if cfg["source_mode"] == "upload":
+        render_upload_mode(cfg)
+    elif cfg["source_mode"] == "dataset":
+        render_dataset_mode(cfg)
     else:
-        render_upload_mode(
-            device_name,
-            inference_mode,
-            building_checkpoint_path,
-            building_threshold,
-        )
+        st.error(f"Mode source inconnu : {cfg['source_mode']}")
 
 
 if __name__ == "__main__":
