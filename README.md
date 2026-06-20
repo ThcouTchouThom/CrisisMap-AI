@@ -49,7 +49,7 @@ Le prototype **n'exporte pas encore** de GeoJSON, GeoTIFF ou projet SIG complet.
 
 ```text
 app/
-  streamlit_app.py              # Application classique stable.
+  streamlit_app.py              # Application Streamlit finale.
 
 src/crisismap/
   data/                         # Dataset xBD, indexation et préparation.
@@ -57,15 +57,36 @@ src/crisismap/
   models/                       # Modèles U-Net, Siamese, multi-temporal, etc.
   training/                     # Entraînement du baseline damage.
 
-scripts/                        # Évaluations, campagnes, outils de résumé.
+scripts/                        # Scripts d’évaluation, de préparation et de reproductibilité.
 configs/                        # Configurations de campagnes expérimentales.
 slurm/                          # Scripts Rorqual / Alliance.
-docs/                           # Documentation projet et livrables finaux.
-docs/final_delivery/            # Livrables finaux et stratégie de rendu.
-sample_data/                    # Petites paires embarquées pour tester sans xBD complet.
+sample_data/                    # Paires embarquées pour tester sans xBD complet.
 data/                           # Données locales ignorées par Git.
-outputs/                        # Sorties ignorées, sauf les deux checkpoints portables retenus.
-demo_assets/                    # Exemples locaux de démo, ignorés par Git.
+outputs/                        # Checkpoints portables retenus et sorties locales ignorées.
+
+Rapport_Final.pdf               # Rapport final.
+Deck-Pitch-Final.pdf            # Pitch deck final.
+fiche_produit.md                # Fiche produit une page.
+video_demo_youtube_link.txt     # Lien vers la vidéo de démonstration.
+```
+
+## Livrables finaux
+
+Les livrables finaux sont placés à la racine du dépôt :
+
+* `Rapport_Final.pdf` : rapport final du projet ;
+* `Deck-Pitch-Final.pdf` : pitch deck final ;
+* `fiche_produit.md` : fiche produit une page ;
+* `video_demo_youtube_link.txt` : lien vers la vidéo promotionnelle ;
+* `README.md` : README technique d’installation, lancement et test ;
+* `app/streamlit_app.py` : prototype Streamlit exécutable ;
+* `sample_data/demo_pairs/` : exemples embarqués pour tester sans dataset complet ;
+* `outputs/checkpoints/...` : checkpoints portables nécessaires au prototype.
+
+Commande de lancement principale :
+
+```powershell
+python -m streamlit run app/streamlit_app.py
 ```
 
 ## Prérequis
