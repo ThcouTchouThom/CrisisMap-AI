@@ -60,7 +60,7 @@ src/crisismap/
 scripts/                        # Évaluations, campagnes, outils de résumé.
 configs/                        # Configurations de campagnes expérimentales.
 slurm/                          # Scripts Rorqual / Alliance.
-docs/                           # Documentation, plans, sources NotebookLM.
+docs/                           # Documentation projet et livrables finaux.
 docs/final_delivery/            # Livrables finaux et stratégie de rendu.
 sample_data/                    # Petites paires embarquées pour tester sans xBD complet.
 data/                           # Données locales ignorées par Git.

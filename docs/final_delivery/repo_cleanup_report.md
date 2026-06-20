@@ -10,7 +10,7 @@ La commande `git status --short` montre :
 - plusieurs archives ZIP de jalons non suivies;
 - `campaign2_aug_sampler_export.tgz` et son dossier extrait;
 - `demo_assets/`;
-- sources NotebookLM récentes;
+- anciennes sources NotebookLM désormais supprimées au profit de `docs/final_delivery/`;
 - journaux complets locaux;
 - fichiers `souvenir` / `souvenir2`;
 - `video_demo_youtube_link.txt` à la racine;
@@ -138,8 +138,8 @@ Proposition prudente :
 
 ```powershell
 git add README.md .gitignore docs/final_delivery
-git add docs/notebooklm_jalon5
 git add app/streamlit_app.py sample_data
+git add scripts/select_jalon5_demo_pairs.py
 ```
 
 Ajouter séparément les scripts/configs expérimentaux uniquement s'ils doivent faire partie du rendu final.
