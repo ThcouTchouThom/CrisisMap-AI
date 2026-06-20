@@ -1,287 +1,281 @@
-# Aftermath
+# Aftermath / CrisisMap AI
 
 **Voir les dégâts pour agir plus vite.**
 
-Aftermath, aussi appelé CrisisMap AI dans le code, est un projet académique de segmentation des dommages aux bâtiments après catastrophe. Il utilise des paires d'images satellites avant/après issues du dataset xBD/xView2 afin de produire une carte visuelle des bâtiments intacts et endommagés.
+Aftermath est un prototype IA de cartographie automatique des dommages à partir de paires d'images satellite **avant / après catastrophe**. Le projet vise à aider une cellule de crise, une ONG, une collectivité ou un analyste SIG à obtenir rapidement une première lecture visuelle des bâtiments intacts et endommagés.
 
-Équipe : Thomas GOURJAULT, Grégory JOURDAIN, Aurélien CASAGRANDI, Matthis LAHARGOUE.
+Le dépôt contient le code source, les scripts d'expérimentation, les applications Streamlit de démonstration et les documents de rendu final. Les données xBD/xView2 complètes, les sorties expérimentales lourdes et les checkpoints complets restent hors Git.
 
-## Objectif
+## Objectif du projet
 
-Le projet construit une chaîne complète :
-
-```text
-archives xBD/xView2 -> extraction -> index CSV -> splits -> Dataset PyTorch -> modèle -> métriques -> prototype Streamlit
-```
-
-La formulation IA actuelle est une segmentation sémantique à 3 classes :
+L'objectif est de transformer une paire satellite pré/post catastrophe en une carte de segmentation à 3 classes :
 
 | Classe | Signification |
 | --- | --- |
 | `0` | fond / absence de bâtiment |
-| `1` | bâtiment non endommagé |
+| `1` | bâtiment intact ou non endommagé |
 | `2` | bâtiment endommagé |
 
-L'entrée du modèle damage est un tenseur à 6 canaux : image RGB pré-catastrophe + image RGB post-catastrophe. La segmentation multi-niveaux des dommages, plus proche du format original xBD, reste un objectif futur.
-
-## Dataset
-
-Le projet utilise le jeu d'entraînement xBD/xView2. Les données brutes, les images extraites, les checkpoints et les sorties générées ne sont pas versionnés dans Git.
-
-Archives attendues localement :
+Le prototype actuel démontre une chaîne complète :
 
 ```text
-data/raw/archives/train_images_labels_targets.tar
-data/raw/archives/xview_geotransforms.json.tgz
+image pré + image post
+-> modèle damage Siamese Attention
+-> TTA d4
+-> segmentation bâtiment U-Net++ EfficientNet-B4
+-> post-processing par composantes bâtiment
+-> overlay final + masques + incertitude + exports PNG/JSON
 ```
 
-Structure attendue après extraction :
+## Fonctionnalités du prototype
+
+Les applications Streamlit permettent :
+
+- de sélectionner une paire du dataset xBD si les données sont présentes localement;
+- de téléverser manuellement une image avant et une image après catastrophe;
+- de lancer une inférence damage;
+- d'utiliser la TTA d4 pour stabiliser la prédiction;
+- d'utiliser un masque bâtiment prédit;
+- d'appliquer un post-processing par `component majority`;
+- d'afficher l'overlay final sur l'image post-catastrophe;
+- d'afficher les sorties intermédiaires : damage brut, masque bâtiment, damage final;
+- d'afficher l'incertitude;
+- d'afficher les métriques quand une vérité terrain est disponible;
+- d'exporter des PNG et un rapport JSON.
+
+Le prototype **n'exporte pas encore** de GeoJSON, GeoTIFF ou projet SIG complet. L'intégration QGIS/ArcGIS, une API publique et le géoréférencement opérationnel sont des perspectives futures.
+
+## Architecture globale du dépôt
 
 ```text
-data/raw/xbd/train/images/
-data/raw/xbd/train/labels/
-data/raw/xbd/train/targets/
-data/raw/geotransforms/xview_geotransforms.json
-```
+app/
+  streamlit_app.py              # Application classique stable.
 
-`xview_geotransforms.json` contient des métadonnées de géoréférencement utiles pour replacer plus tard les prédictions dans une carte ou un outil GIS. Ces données sont extraites, mais elles ne sont pas encore intégrées à l'entraînement.
-
-## Structure du dépôt
-
-```text
-app/                         # Prototype Streamlit.
-configs/                     # Notes et configurations éventuelles.
-data/                        # Données locales et CSV traités; les fichiers lourds sont ignorés.
-deliverables/                # Sources légères de livrables de cours.
-docs/                        # Documentation projet et onboarding.
-outputs/                     # Checkpoints, figures, métriques; non suivis.
-scripts/                     # Scripts utilitaires, splits avancés, évaluations complémentaires.
-slurm/                       # Scripts Alliance / Rorqual.
 src/crisismap/
-  data/                      # Inspection, indexation, splits, Dataset PyTorch.
-  evaluation/                # Évaluation et visualisation de prédictions.
-  models/                    # U-Net.
-  training/                  # Entraînement damage.
-  visualization/             # Figures dataset et métriques.
+  data/                         # Dataset xBD, indexation et préparation.
+  evaluation/                   # Évaluation et visualisation de prédictions.
+  models/                       # Modèles U-Net, Siamese, multi-temporal, etc.
+  training/                     # Entraînement du baseline damage.
+
+scripts/                        # Évaluations, campagnes, outils de résumé.
+configs/                        # Configurations de campagnes expérimentales.
+slurm/                          # Scripts Rorqual / Alliance.
+docs/                           # Documentation, plans, sources NotebookLM.
+docs/final_delivery/            # Livrables finaux et stratégie de rendu.
+sample_data/                    # Petites paires embarquées pour tester sans xBD complet.
+data/                           # Données locales ignorées par Git.
+outputs/                        # Sorties ignorées, sauf les deux checkpoints portables retenus.
+demo_assets/                    # Exemples locaux de démo, ignorés par Git.
 ```
 
-## Pipeline de données
+## Prérequis
 
-Les scripts principaux sont :
+- Python 3.11 recommandé;
+- Windows PowerShell ou Linux/macOS shell;
+- GPU CUDA recommandé pour une démonstration fluide, mais le CPU reste possible pour des tests légers;
+- accès local aux checkpoints nécessaires;
+- optionnel : données xBD/xView2 pour le mode dataset.
 
-- `src/crisismap/data/inspect_xbd.py` : inspection de la structure xBD.
-- `src/crisismap/data/build_xbd_index.py` : construction de `data/processed/xbd_train_index.csv`.
-- `src/crisismap/data/summarize_xbd_index.py` : statistiques exploratoires.
-- `src/crisismap/data/create_xbd_splits.py` : création de splits simples.
-- `scripts/create_noleak_common_eval_splits.py` : création de splits sans fuite autour d'une validation et d'un test communs.
-- `scripts/create_advanced_noleak_train_splits.py` : génération de splits no-leak avancés.
-- `src/crisismap/data/xbd_dataset.py` : Dataset PyTorch pour les paires pré/post.
-
-Le dataset brut contient 2 799 paires pré/post. Certains splits filtrent les images avec trop peu d'information bâtiment, notamment via `min_nonzero_ratio >= 0.01`.
-
-## Méthodologie no-leak
-
-Des comparaisons intermédiaires ont révélé un risque de fuite de données entre certains splits d'entraînement et un test global. Le protocole actuel fixe donc une validation et un test communs :
-
-```text
-common_val  = data/processed/splits_full/val_pairs.csv
-common_test = data/processed/splits_full/test_pairs.csv
-```
-
-Les nouveaux splits d'entraînement excluent tous les `pair_id` présents dans ces deux fichiers. La validation et le test ne sont jamais augmentés et n'utilisent pas de sampler pondéré.
-
-## Baseline damage
-
-Le baseline principal est un U-Net :
-
-- entrée : 6 canaux, pré RGB + post RGB ;
-- sortie : 3 classes ;
-- perte de référence : Cross-Entropy pondérée + Dice loss ;
-- poids de référence : `[0.05, 1.0, 4.0]` ;
-- expériences en 512 et 1024 pixels.
-
-La référence no-leak actuelle donne environ `IoU damaged = 0.4175` et `F1 damaged = 0.5891`. La classe endommagée reste la plus difficile, car elle est rare et moins régulière que le fond ou les bâtiments intacts.
-
-## Oracle et branche bâtiment
-
-Une expérience oracle a mesuré le gain théorique d'une segmentation bâtiment parfaite :
-
-- prédiction brute : `IoU damaged ≈ 0.4175`, `F1 damaged ≈ 0.5891` ;
-- oracle building clip : `IoU damaged ≈ 0.4782`, `F1 damaged ≈ 0.6470` ;
-- oracle component majority : `IoU damaged ≈ 0.5383`, `F1 damaged ≈ 0.6999`.
-
-Ce résultat motive une future architecture en deux étapes : segmenter les bâtiments, puis classifier les dommages par pixel ou par composante bâtiment.
-
-Une branche building-only a été ajoutée pour la tâche binaire `fond / bâtiment`, avec `target = original_target > 0`. Le premier modèle testé est un U-Net++ EfficientNet-B3 en entrée pré-catastrophe, avec focal Tversky. Les métriques préliminaires de validation sont environ `building IoU = 0.6536`, `recall = 0.8120`, `F1 = 0.7905`.
-
-Le premier test downstream avec le masque bâtiment prédit montre que le masque augmente la précision sur la classe endommagée, mais perd encore trop de rappel pour remplacer la prédiction damage brute. La piste reste donc expérimentale tant que le segmentateur bâtiment n'est pas amélioré.
-
-## Prototype Streamlit
-
-Le prototype alpha Streamlit permet :
-
-- de sélectionner une paire du dataset xBD ;
-- de téléverser une paire réelle pré/post ;
-- de lancer l'inférence ;
-- d'afficher en priorité la superposition de la prédiction sur l'image post-catastrophe ;
-- d'afficher les détails : image avant, image après, masque prédit ;
-- d'afficher des métriques seulement en mode dataset, quand la vérité terrain existe.
-
-Commande :
-
-```powershell
-streamlit run app/streamlit_app.py
-```
-
-Le checkpoint de démonstration attendu n'est pas dans Git :
-
-```text
-outputs/checkpoints/unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs/best_unet_portable.pt
-```
-
-## Installation locale
-
-Créer un environnement Python puis installer les dépendances :
+## Installation locale Windows
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-Installation complète à partir des archives locales :
+## Installation locale Linux / macOS
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/setup_project.ps1
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Reconstruction forcée des fichiers traités :
+## Dépendances principales
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/setup_project.ps1 -Force
-```
+Le fichier `requirements.txt` contient notamment :
 
-## Commandes utiles
+- `torch`, `torchvision`;
+- `streamlit`;
+- `segmentation-models-pytorch==0.5.0`;
+- `timm==1.0.27`;
+- `numpy`, `pandas`, `pillow`, `opencv-python`, `matplotlib`;
+- `shapely` pour les annotations xBD.
 
-Inspection :
+## Checkpoints inclus dans le dépôt final
 
-```powershell
-python src/crisismap/data/inspect_xbd.py --root data/raw/xbd/train
-```
-
-Indexation :
-
-```powershell
-python src/crisismap/data/build_xbd_index.py --root data/raw/xbd/train --output data/processed/xbd_train_index.csv
-```
-
-Entraînement damage :
-
-```powershell
-python src/crisismap/training/train_unet.py `
-  --root data/raw/xbd/train `
-  --train-csv data/processed/splits/train_pairs.csv `
-  --val-csv data/processed/splits/val_pairs.csv `
-  --output-dir outputs/checkpoints/unet_baseline `
-  --image-size 512 `
-  --batch-size 2 `
-  --epochs 5 `
-  --target-mode 3-class `
-  --loss ce-dice `
-  --class-weights 0.05 1.0 4.0
-```
-
-Évaluation :
-
-```powershell
-python src/crisismap/evaluation/evaluate_unet.py `
-  --root data/raw/xbd/train `
-  --split-csv data/processed/splits/test_pairs.csv `
-  --checkpoint outputs/checkpoints/unet_baseline/best_unet.pt `
-  --output outputs/predictions/unet_baseline_test_metrics.json `
-  --image-size 512 `
-  --target-mode 3-class
-```
-
-Oracle building mask :
-
-```powershell
-python scripts/evaluate_oracle_building_mask_gain.py `
-  --root data/raw/xbd/train `
-  --split-csv data/processed/splits_full/test_pairs.csv `
-  --checkpoint outputs/checkpoints/unet_1024_ce_dice_w005_1_4_noleak_match_hist1000_bs2_250epochs/best_unet.pt `
-  --output-json outputs/predictions/oracle_building_mask_metrics.json
-```
-
-Segmentation bâtiment :
-
-```powershell
-python scripts/train_building_segmentation.py `
-  --root data/raw/xbd/train `
-  --train-csv data/processed/splits_noleak_full_train/train_pairs.csv `
-  --val-csv data/processed/splits_noleak_full_train/val_pairs.csv `
-  --output-dir outputs/checkpoints/building_pre_unetplusplus_effb3 `
-  --model unetplusplus_effb3 `
-  --input-mode pre `
-  --target-mode building-binary
-```
-
-## Rorqual / SLURM
-
-Les entraînements lourds sont préparés pour Alliance / Calcul Québec, notamment Rorqual H100. Les fichiers utiles sont dans `slurm/`.
-
-Repères :
-
-- code : `~/work/CrisisMap-AI` ;
-- données et sorties : `~/scratch/CrisisMap-AI` ;
-- venv : `~/virtualenvs/crisismap-ai` ;
-- modules : `StdEnv/2023`, `python/3.11`, `gcc`, `arrow/23.0.1`, `cuda`, `opencv/4.13.0`.
-
-Les scripts SLURM incluent des notifications courriel afin d'éviter le polling fréquent du scheduler. Il faut préférer des vérifications ponctuelles avec `squeue -u $USER` et la lecture des logs.
-
-La campagne augmentation/sampler damage de Jalon 3 est terminée avec 32 runs Rorqual. Elle confirme que l'augmentation `damage-aware` est utile, surtout sans sampler, tandis que les samplers augmentent souvent le rappel au prix de la précision. Deux campagnes longues sont ensuite préparées ou lancées : une sélection `long250` pour les meilleurs candidats damage, et une campagne `Building100` plus large pour la segmentation binaire des bâtiments.
-
-## Livrables
-
-Le dossier local de rendu Jalon 3 est ignoré par Git :
+Le dépôt final inclut les deux checkpoints portables nécessaires à l'application :
 
 ```text
-RENDU_JALON_3_Aftermath/
-RENDU_JALON_3_Aftermath.zip
+outputs/checkpoints/dftv2_hist1000_attention_sqrt2_ft_250_seed0/best_damage_arch_portable.pt
+outputs/checkpoints/b400_effb4_sampler8_ft/best_building_portable.pt
 ```
 
-Il contient un rapport unique, des scripts représentatifs, des exemples légers et des notes expliquant les checkpoints exclus pour respecter les limites d'upload.
-
-Des sources Markdown légères pour NotebookLM sont aussi disponibles dans :
+Fallbacks acceptés par l'application :
 
 ```text
-deliverables/jalon_3/notebooklm_sources/
+outputs/checkpoints/dftv2_hist1000_attention_sqrt2_ft_250_seed0/best_damage_arch.pt
+outputs/checkpoints/b400_effb4_sampler8_ft/best_building.pt
 ```
 
-## État actuel et prochaines étapes
+Tailles locales constatées :
 
-Terminé :
+- damage portable : environ 33.9 Mo;
+- building portable : environ 80.2 Mo.
 
-- pipeline xBD/xView2 ;
-- visualisations et index CSV ;
-- Dataset PyTorch ;
-- U-Net baseline ;
-- protocole no-leak ;
-- expérience oracle bâtiment ;
-- première branche building-only ;
-- prototype Streamlit alpha avec mode upload.
+Ces deux fichiers sont sous la limite GitHub de 100 Mo par fichier. Les autres checkpoints expérimentaux restent exclus.
 
-En cours :
+## Données nécessaires
 
-- comparaison longue `250 epochs` des meilleurs candidats damage ;
-- campagne `Building100` pour sélectionner un meilleur segmentateur bâtiment ;
-- intégration expérimentale du masque bâtiment prédit dans l'évaluation downstream.
+### Mode upload manuel
 
-Étapes futures :
+Le mode upload fonctionne sans dataset complet : il suffit de fournir deux images RGB compatibles, avant et après catastrophe.
 
-- intégrer un masque bâtiment prédit seulement s'il améliore les métriques damage ;
-- améliorer les contours et réduire les faux positifs ;
-- revenir à une segmentation multi-niveaux des dommages ;
-- exploiter les geotransforms pour une carte géoréférencée ;
-- tester des architectures plus fortes : Siamese U-Net, SegFormer, ChangeFormer, modèles hybrides segmentation/classification.
+### Mode exemples dataset
+
+Pour utiliser les exemples xBD dans l'application, les données doivent être présentes localement :
+
+```text
+data/raw/xbd/train/images/
+data/raw/xbd/train/labels/
+data/raw/xbd/train/targets/
+data/processed/splits/
+```
+
+Les données complètes xBD/xView2 ne sont pas incluses dans Git.
+
+## Lancer l'application classique
+
+```powershell
+python -m streamlit run app/streamlit_app.py
+```
+
+Cette version est la version sûre pour l'évaluation.
+
+## Tester rapidement la compilation
+
+```powershell
+python -m py_compile app/streamlit_app.py
+```
+
+## Tester avec les exemples embarqués
+
+Le dépôt final contient quelques paires légères dans :
+
+```text
+sample_data/demo_pairs/
+```
+
+Pour les utiliser :
+
+1. lancer l'application classique;
+2. choisir le mode **Exemples inclus**;
+3. sélectionner une paire;
+4. cliquer sur **Analyser**.
+
+Ce mode ne nécessite pas le dataset xBD complet.
+
+## Tester avec les exemples dataset
+
+1. Vérifier que les dossiers `data/raw/xbd/train/` et `data/processed/splits/` existent.
+2. Lancer l'application.
+3. Choisir le mode dataset.
+4. Sélectionner une paire recommandée.
+5. Lancer l'inférence.
+
+Les paires recommandées sont définies dans `RECOMMENDED_PAIR_IDS` dans `app/streamlit_app.py`.
+
+## Tester avec upload manuel
+
+1. Lancer l'application.
+2. Choisir le mode upload.
+3. Charger une image avant catastrophe.
+4. Charger une image après catastrophe.
+5. Lancer l'inférence.
+
+Sans vérité terrain, l'application affiche une prédiction et des statistiques, mais pas de métriques supervisées.
+
+## Exports disponibles
+
+Exports actuels :
+
+- masque PNG;
+- overlay PNG;
+- rapport JSON.
+
+Exports non disponibles dans le prototype actuel :
+
+- GeoJSON;
+- GeoTIFF;
+- projet QGIS/ArcGIS;
+- API publique;
+- géoréférencement opérationnel.
+
+Ces éléments sont documentés comme perspectives futures.
+
+## Résultats principaux
+
+| Modèle / pipeline | F1 damaged | IoU damaged | Mean IoU |
+| --- | ---: | ---: | ---: |
+| Baseline U-Net + TTA d4 | 0.6313 | 0.4612 | 0.6816 |
+| Ancien champion Siamese | 0.6788 | 0.5138 | 0.7073 |
+| Champion intégré `dftv2_hist1000_attention_sqrt2_ft_250_seed0` | 0.7013 | 0.5400 | 0.7283 |
+| Dernier run marginalement meilleur `dftv2_hist1000_attention_sqrt4_ft_400_seed0` | 0.7018 | 0.5406 | 0.7273 |
+
+Décision finale : le modèle intégré reste `dftv2_hist1000_attention_sqrt2_ft_250_seed0`, car il est stabilisé, portable et testé dans l'application. Le dernier run disponible est seulement marginalement meilleur.
+
+Champion building :
+
+| Modèle | F1 building | IoU building |
+| --- | ---: | ---: |
+| `b400_effb4_sampler8_ft` - U-Net++ EfficientNet-B4 | 0.8504 | 0.7398 |
+
+## Limites connues
+
+- prototype académique, non opérationnel terrain;
+- dépendance forte à la disponibilité et à la qualité des images satellite;
+- risque d'erreur sur les bâtiments et les dommages;
+- formulation actuelle simplifiée à 3 classes;
+- pas encore de score officiel xView2 5 classes;
+- pas encore d'intégration SIG complète;
+- supervision humaine nécessaire.
+
+Aftermath doit être présenté comme une aide à la décision, pas comme un outil remplaçant l'expertise humaine.
+
+## Livrables finaux
+
+Les fichiers de préparation du rendu final sont dans :
+
+```text
+docs/final_delivery/
+```
+
+Contenu attendu :
+
+- `README_LIVRABLES_FINAUX.md`;
+- `fiche_produit_1page.md`;
+- `video_demo_youtube_link.txt`;
+- `checklist_rendu_final.md`;
+- `repo_cleanup_report.md`;
+- `checkpoints_and_data_strategy.md`.
+
+Le pitch deck final, le rapport final 10-15 pages et la vidéo de démonstration peuvent être référencés depuis ce dossier.
+
+## Équipe
+
+- Thomas GOURJAULT;
+- Grégory JOURDAIN;
+- Aurélien CASAGRANDI;
+- Matthis LAHARGOUE.
+
+## Crédit dataset
+
+Le projet utilise xBD / xView2 comme dataset de référence pour l'évaluation des dommages sur bâtiments à partir d'images satellite pré/post catastrophe.
+
+À citer dans le rapport ou les slides :
+
+- xBD: A Dataset for Assessing Building Damage from Satellite Imagery;
+- xView2 Challenge: Assess Building Damage.

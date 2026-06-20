@@ -18,6 +18,7 @@ import torch
 from PIL import Image, ImageOps
 
 RESAMPLE_BILINEAR = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+RESAMPLE_NEAREST = Image.Resampling.NEAREST if hasattr(Image, "Resampling") else Image.NEAREST
 
 
 # == Chemins du projet =========================================================
@@ -71,6 +72,7 @@ except ImportError:
 
 
 DATA_ROOT = PROJECT_ROOT / "data" / "raw" / "xbd" / "train"
+SAMPLE_PAIRS_ROOT = PROJECT_ROOT / "sample_data" / "demo_pairs"
 SPLIT_DIR_CANDIDATES = [
     PROJECT_ROOT / "data" / "processed" / "splits",
     PROJECT_ROOT / "data" / "processed" / "splits_full",
@@ -177,18 +179,21 @@ PIPELINES: dict[str, dict[str, Any]] = {
 
 SOURCE_MODES = {
     "upload": "Téléverser des images",
+    "embedded": "Exemples inclus",
     "dataset": "Exemples du dataset",
 }
 
 THEME_LABELS = ["Sombre", "Clair", "Système"]
 
 RECOMMENDED_PAIR_IDS = [
-    "hurricane-florence_00000070",
-    "hurricane-florence_00000217",
-    "hurricane-florence_00000153",
-    "hurricane-harvey_00000358",
-    "santa-rosa-wildfire_00000093",
-    "palu-tsunami_00000109",
+    "hurricane-michael_00000085",
+    "hurricane-michael_00000446",
+    "palu-tsunami_00000019",
+    "palu-tsunami_00000183",
+    "santa-rosa-wildfire_00000117",
+    "santa-rosa-wildfire_00000011",
+    "hurricane-michael_00000239",
+    "hurricane-harvey_00000478",
 ]
 
 DISASTER_INFO: dict[str, tuple[str, str]] = {
@@ -452,6 +457,27 @@ def read_upload(file, size: int) -> np.ndarray:
         img = ImageOps.exif_transpose(img).convert("RGB")
         img = img.resize((size, size), RESAMPLE_BILINEAR)
         return np.asarray(img, dtype=np.uint8)
+
+
+def read_rgb_path(path: Path, size: int) -> np.ndarray:
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img = img.resize((size, size), RESAMPLE_BILINEAR)
+        return np.asarray(img, dtype=np.uint8)
+
+
+def read_demo_target(path: Path, size: int) -> np.ndarray:
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        img = img.resize((size, size), RESAMPLE_NEAREST)
+        rgb = np.asarray(img, dtype=np.uint8)
+
+    red = (rgb[:, :, 0] > 140) & (rgb[:, :, 1] < 120)
+    green = (rgb[:, :, 1] > 120) & (rgb[:, :, 0] < 120)
+    target = np.zeros(rgb.shape[:2], dtype=np.int16)
+    target[green] = 1
+    target[red] = 2
+    return target
 
 
 def colorize(mask: np.ndarray) -> np.ndarray:
@@ -1217,10 +1243,12 @@ def render_sidebar() -> dict[str, Any]:
 
     st.sidebar.divider()
     st.sidebar.markdown("**Source de données**")
+    source_keys = list(SOURCE_MODES)
+    default_source_index = source_keys.index("embedded") if list_embedded_pairs() else source_keys.index("upload")
     source_mode = st.sidebar.radio(
         "Source",
-        list(SOURCE_MODES),
-        index=0,
+        source_keys,
+        index=default_source_index,
         format_func=lambda key: SOURCE_MODES[key],
         label_visibility="collapsed",
     )
@@ -1256,6 +1284,107 @@ def prepare_models(cfg: dict[str, Any]):
     )
     building_model = load_building_model(cfg["device"]) if cfg["use_building"] else None
     return damage_model, building_model
+
+
+def list_embedded_pairs() -> list[str]:
+    if not SAMPLE_PAIRS_ROOT.exists():
+        return []
+    return sorted(
+        path.name
+        for path in SAMPLE_PAIRS_ROOT.iterdir()
+        if path.is_dir() and (path / "pre.png").exists() and (path / "post.png").exists()
+    )
+
+
+def render_embedded_mode(cfg: dict[str, Any]) -> None:
+    render_section("Exemples inclus dans le dépôt")
+    pair_ids = list_embedded_pairs()
+    if not pair_ids:
+        st.error(
+            "Aucun exemple embarqué trouvé. Vérifiez le dossier "
+            f"`{SAMPLE_PAIRS_ROOT.relative_to(PROJECT_ROOT)}` ou utilisez le mode upload."
+        )
+        return
+
+    st.info(
+        "Ces paires légères permettent de tester Aftermath sans télécharger le dataset xBD complet. "
+        "Elles servent uniquement à la démonstration."
+    )
+
+    col_select, col_button = st.columns([4, 1])
+    pair_id = col_select.selectbox("Exemple inclus", pair_ids, label_visibility="collapsed")
+    pair_dir = SAMPLE_PAIRS_ROOT / pair_id
+    analyze = col_button.button("Analyser", type="primary", width="stretch")
+
+    size = int(cfg["model_cfg"]["image_size"])
+    try:
+        pre_np = read_rgb_path(pair_dir / "pre.png", size)
+        post_np = read_rgb_path(pair_dir / "post.png", size)
+    except OSError as exc:
+        st.error(f"Impossible de lire l'exemple embarqué `{pair_id}` : {exc}")
+        return
+
+    preview_cols = st.columns(2)
+    preview_cols[0].image(pre_np, caption="Avant catastrophe", width="stretch")
+    preview_cols[1].image(post_np, caption="Après catastrophe", width="stretch")
+
+    cache_key = (
+        "embedded",
+        pair_id,
+        cfg["model_id"],
+        cfg["pipeline_id"],
+        cfg["building_threshold"],
+        cfg["building_tta"],
+    )
+    if analyze:
+        st.session_state["embedded_pending_key"] = cache_key
+
+    if (
+        st.session_state.get("embedded_pending_key") == cache_key
+        and st.session_state.get("embedded_done_key") != cache_key
+    ):
+        with st.spinner("Analyse en cours..."):
+            try:
+                stacked = np.concatenate([pre_np, post_np], axis=2).transpose(2, 0, 1)
+                image = torch.from_numpy(stacked.copy()).float().div(255.0)
+                damage_model, building_model = prepare_models(cfg)
+                inference = run_inference(
+                    damage_model,
+                    image,
+                    cfg["device"],
+                    cfg["damage_tta"],
+                    cfg["use_building"],
+                    building_model,
+                    cfg["building_threshold"],
+                    cfg["building_tta"],
+                )
+            except (AppError, RuntimeError, OSError, ValueError) as exc:
+                st.error(str(exc))
+                return
+
+        target = read_demo_target(pair_dir / "target.png", size) if (pair_dir / "target.png").exists() else None
+        record = build_result_record(
+            pre=pre_np,
+            post=post_np,
+            inference=inference,
+            target=target,
+            pair_id=pair_id,
+            model_name=cfg["model_label"],
+            pipeline_label=cfg["pipeline_label"],
+        )
+        st.session_state["embedded_cache_key"] = cache_key
+        st.session_state["embedded_cache"] = record
+        st.session_state["embedded_done_key"] = cache_key
+        stats = compute_metrics(record["final_pred"], target) if target is not None else prediction_stats(record["final_pred"])
+        add_to_history(pair_id, cfg["model_label"], cfg["pipeline_label"], stats)
+
+    record = None
+    if st.session_state.get("embedded_cache_key") == cache_key:
+        record = st.session_state.get("embedded_cache")
+    if record is None:
+        st.info("Sélectionnez un exemple inclus et cliquez sur Analyser.")
+        return
+    render_results(record, cfg["use_building"])
 
 
 def render_dataset_mode(cfg: dict[str, Any]) -> None:
@@ -1469,6 +1598,8 @@ def main() -> None:
 
     if cfg["source_mode"] == "upload":
         render_upload_mode(cfg)
+    elif cfg["source_mode"] == "embedded":
+        render_embedded_mode(cfg)
     elif cfg["source_mode"] == "dataset":
         render_dataset_mode(cfg)
     else:

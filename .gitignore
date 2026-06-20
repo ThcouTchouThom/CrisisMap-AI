@@ -12,6 +12,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.env/
 
 # Environment and local config
 .env
@@ -41,6 +42,10 @@ outputs/*
 !outputs/checkpoints/
 outputs/checkpoints/*
 !outputs/checkpoints/README.md
+!outputs/checkpoints/dftv2_hist1000_attention_sqrt2_ft_250_seed0/
+!outputs/checkpoints/dftv2_hist1000_attention_sqrt2_ft_250_seed0/best_damage_arch_portable.pt
+!outputs/checkpoints/b400_effb4_sampler8_ft/
+!outputs/checkpoints/b400_effb4_sampler8_ft/best_building_portable.pt
 !outputs/figures/
 outputs/figures/*
 !outputs/figures/README.md
@@ -58,19 +63,38 @@ Thumbs.db
 *.pdf
 
 # Local milestone ZIP staging folders
+RENDU_JALON_1_Aftermath/
+RENDU_JALON_1_Aftermath.zip
 RENDU_JALON_2_Aftermath/
 RENDU_JALON_2_Aftermath.zip
 RENDU_JALON_3_Aftermath/
 RENDU_JALON_3_Aftermath.zip
 RENDU_JALON_4_Aftermath/
 RENDU_JALON_4_Aftermath.zip
+JALON_*_Aftermath_*.zip
 
 # Model weights and exported models
 *.pt
 *.pth
 *.ckpt
 *.onnx
+!outputs/checkpoints/dftv2_hist1000_attention_sqrt2_ft_250_seed0/best_damage_arch_portable.pt
+!outputs/checkpoints/b400_effb4_sampler8_ft/best_building_portable.pt
 
 # Logs
 logs/
 *.log
+run_logs/
+
+# Local exports, reports and draft working notes
+demo_assets/
+campaign2_aug_sampler_export/
+campaign2_aug_sampler_export.tgz
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+journal_complet_crisismap_aftermath*.md
+souvenir*
+run_building_overnight.ps1
+/video_demo_youtube_link.txt
